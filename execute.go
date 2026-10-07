@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"net"
+	"io"
 )
 
 // SQLError distinguishes a server-reported SQL-level failure (an ERR packet
@@ -53,11 +53,17 @@ func (c *Conn) prepare(sqlText string, hasResultSet bool) (preparedStmt, error) 
 	if err != nil {
 		return preparedStmt{}, err
 	}
+	if len(resp) == 0 {
+		return preparedStmt{}, fmt.Errorf("prepare %q: empty response packet", sqlText)
+	}
 	if resp[0] == 0xFF {
 		return preparedStmt{}, fmt.Errorf("prepare %q failed: %s", sqlText, errPacketText(resp))
 	}
 	if resp[0] != 0x00 {
 		return preparedStmt{}, fmt.Errorf("prepare %q: unexpected first byte 0x%02x", sqlText, resp[0])
+	}
+	if len(resp) < 9 {
+		return preparedStmt{}, fmt.Errorf("prepare %q: OK packet too short (%d bytes, want at least 9)", sqlText, len(resp))
 	}
 	id := binary.LittleEndian.Uint32(resp[1:5])
 	columnCount := int(binary.LittleEndian.Uint16(resp[5:7]))
@@ -155,10 +161,13 @@ func buildExecutePayload(stmtID uint32, args []any) ([]byte, error) {
 // correctly advancing past them (to stay in sync for the next statement's
 // response) never requires understanding their binary-encoded contents.
 // See the result-set-decoding issue for turning this into real data.
-func drainExecuteResponse(raw net.Conn, hasResultSet bool) error {
+func drainExecuteResponse(raw io.Reader, hasResultSet bool) error {
 	resp, err := readPacket(raw)
 	if err != nil {
 		return err
+	}
+	if len(resp) == 0 {
+		return fmt.Errorf("empty response packet")
 	}
 	if resp[0] == 0xFF {
 		return &SQLError{msg: errPacketText(resp)}
@@ -186,6 +195,9 @@ func drainExecuteResponse(raw net.Conn, hasResultSet bool) error {
 		if err != nil {
 			return err
 		}
+		if len(row) == 0 {
+			return fmt.Errorf("empty row packet")
+		}
 		if row[0] == 0xFF {
 			return &SQLError{msg: errPacketText(row)}
 		}
@@ -196,14 +208,17 @@ func drainExecuteResponse(raw net.Conn, hasResultSet bool) error {
 	}
 }
 
-func writeComQuery(w net.Conn, text string) error {
+func writeComQuery(w io.Writer, text string) error {
 	return writePacket(w, append([]byte{comQuery}, text...))
 }
 
-func readOKorErr(raw net.Conn) error {
+func readOKorErr(raw io.Reader) error {
 	resp, err := readPacket(raw)
 	if err != nil {
 		return err
+	}
+	if len(resp) == 0 {
+		return fmt.Errorf("empty response packet")
 	}
 	if resp[0] == 0xFF {
 		return fmt.Errorf("ERR: %s", errPacketText(resp))
