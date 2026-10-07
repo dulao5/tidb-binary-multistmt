@@ -28,6 +28,10 @@ type StatementResult struct {
 	// Err is nil on success, or the error for this statement (typically a
 	// *SQLError for a server-reported failure).
 	Err error
+	// Result is the decoded result set for a row-returning statement that
+	// succeeded (nil for a non-row-returning statement, or one that
+	// failed).
+	Result *ResultSet
 }
 
 // ExecuteResult is what Conn.Execute returns.
@@ -241,57 +245,67 @@ func buildExecutePayload(stmtID uint32, args []any) ([]byte, error) {
 }
 
 // drainExecuteResponse reads exactly one EXECUTE's response off the wire —
-// a single OK/ERR packet for a non-row-returning statement, or a binary
-// result set (column-count/column-defs/EOF, then rows until a terminal EOF)
-// for one that returns rows. Row *values* are not decoded yet, only
-// skipped — packets are self-delimited by their length header, so
-// correctly advancing past them (to stay in sync for the next statement's
-// response) never requires understanding their binary-encoded contents.
-// See the result-set-decoding issue for turning this into real data.
-func drainExecuteResponse(raw io.Reader, hasResultSet bool) error {
+// a single OK/ERR packet for a non-row-returning statement, or a full
+// binary result set (column-count/column-defs/EOF, then rows until a
+// terminal EOF, each decoded via decodeColumnDef/decodeBinaryRow) for one
+// that returns rows.
+func drainExecuteResponse(raw io.Reader, hasResultSet bool) (*ResultSet, error) {
 	resp, err := readPacket(raw)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(resp) == 0 {
-		return fmt.Errorf("empty response packet")
+		return nil, fmt.Errorf("empty response packet")
 	}
 	if resp[0] == 0xFF {
-		return &SQLError{msg: errPacketText(resp)}
+		return nil, &SQLError{msg: errPacketText(resp)}
 	}
 	if !hasResultSet {
 		if resp[0] != 0x00 {
-			return fmt.Errorf("expected OK, got first byte 0x%02x", resp[0])
+			return nil, fmt.Errorf("expected OK, got first byte 0x%02x", resp[0])
 		}
-		return nil
+		return nil, nil
 	}
 
 	columnCount := readLenEncInt(resp)
+	cols := make([]Column, 0, columnCount)
 	for i := uint64(0); i < columnCount; i++ {
-		if _, err := readPacket(raw); err != nil {
-			return err
+		defPkt, err := readPacket(raw)
+		if err != nil {
+			return nil, err
 		}
+		col, err := decodeColumnDef(defPkt)
+		if err != nil {
+			return nil, fmt.Errorf("column %d: %w", i, err)
+		}
+		cols = append(cols, col)
 	}
 	if columnCount > 0 {
 		if _, err := readPacket(raw); err != nil { // EOF after column defs
-			return err
+			return nil, err
 		}
 	}
+
+	rs := &ResultSet{Columns: cols}
 	for {
 		row, err := readPacket(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if len(row) == 0 {
-			return fmt.Errorf("empty row packet")
+			return nil, fmt.Errorf("empty row packet")
 		}
 		if row[0] == 0xFF {
-			return &SQLError{msg: errPacketText(row)}
+			return nil, &SQLError{msg: errPacketText(row)}
 		}
 		if row[0] == 0xFE && len(row) < 9 {
-			return nil // terminal EOF
+			return rs, nil // terminal EOF
 		}
-		// else: a binary row packet (leading 0x00) — discard, keep reading.
+		values, err := decodeBinaryRow(row, cols)
+		if err != nil {
+			return nil, fmt.Errorf("row %d: %w", len(rs.Rows), err)
+		}
+		rs.Rows = append(rs.Rows, values)
 	}
 }
 
@@ -361,8 +375,8 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 	results := make([]StatementResult, len(stmts))
 	allOK := true
 	for i, s := range stmts {
-		err := drainExecuteResponse(c.raw, s.HasResultSet)
-		results[i] = StatementResult{Index: i, SQL: s.SQL, Err: err}
+		rs, err := drainExecuteResponse(c.raw, s.HasResultSet)
+		results[i] = StatementResult{Index: i, SQL: s.SQL, Err: err, Result: rs}
 		if err != nil {
 			var sqlErr *SQLError
 			if !errors.As(err, &sqlErr) {

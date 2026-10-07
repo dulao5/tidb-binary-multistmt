@@ -81,6 +81,19 @@ if !res.AllSucceeded {
     return
 }
 // every statement succeeded — Execute already sent COMMIT.
+for _, r := range res.Results {
+    if r.Result == nil { // not a row-returning statement
+        continue
+    }
+    for _, col := range r.Result.Columns {
+        fmt.Print(col.Name, "\t")
+    }
+    for _, row := range r.Result.Rows {
+        for _, v := range row {
+            fmt.Print(v, "\t") // nil for SQL NULL
+        }
+    }
+}
 ```
 
 - `HasResultSet` (the third `Add` argument) must be `true` iff the statement
@@ -100,6 +113,21 @@ if !res.AllSucceeded {
   command to the server — it has no idea they're "one batch"), so row locks
   must already be held as each statement runs, not deferred to commit, for
   "any failure → roll back everything" to stay correct.
+
+### Result sets
+
+`StatementResult.Result` (`*ResultSet`) is set for a successful row-returning
+statement: `Columns` (name/type/`Unsigned`/`Decimals`, decoded from the
+server's own column metadata) and `Rows` (`[][]any`, one value per column,
+`nil` for SQL `NULL`). Go value types per MySQL column type:
+
+| MySQL type family | Go type |
+|---|---|
+| `TINY`/`SHORT`/`LONG`/`LONGLONG`/`INT24`/`YEAR` | `int64`, or `uint64` if the column is `UNSIGNED` |
+| `FLOAT`/`DOUBLE` | `float64` |
+| `DATE`/`DATETIME`/`TIMESTAMP` | `time.Time` |
+| `TIME` | `time.Duration` (can be negative; MySQL `TIME` isn't bounded to 24h) |
+| `VARCHAR`/`TEXT`/`BLOB` family/`DECIMAL`/`JSON`/`ENUM`/`SET`/`BIT`/`GEOMETRY` | `[]byte` — this package doesn't know a column's charset well enough to decide when a `string` conversion is safe, so it leaves that (and its cost) to the caller |
 
 ### `WHERE id IN (?)` / bulk `INSERT`
 
@@ -130,9 +158,13 @@ and leaves the transaction open for the caller's `Rollback`, a `SELECT` in
 the middle of a batch doesn't desync the statements after it, every
 supported parameter type round-trips correctly (read back through a normal
 driver connection, confirming TiDB itself understood the encoded values —
-not just that this package's own encode/decode is self-consistent), and
+not just that this package's own encode/decode is self-consistent),
 `ExpandIn`/`ExpandValues` compose correctly with the pipelined-binary
-execution path end to end.
+execution path end to end, and a `SELECT` covering every supported column
+type (including an unsigned max value and a microsecond-precision
+`DATETIME`) decodes correctly through this package's own `ResultSet` —
+column metadata and row bytes TiDB actually sends, not hand-crafted
+fixtures.
 
 Parameter binding uses genuine `COM_STMT_EXECUTE` binary protocol
 parameters throughout — including through `ExpandIn`/`ExpandValues` — never
@@ -154,9 +186,6 @@ reason about here.
   larger values the way go-sql-driver/mysql has. In practice this is a very
   generous ceiling for normal column values; it only matters for genuinely
   large BLOBs/TEXT.
-- **Result sets are not decoded.** A `SELECT`'s binary row packets are
-  skipped (just enough parsing to stay aligned with the next statement's
-  response), not turned into usable data.
 - **Assumes `CLIENT_DEPRECATE_EOF` is never negotiated.** This package's
   `PREPARE`/`EXECUTE` response parsing expects EOF packets after
   param-definition and column-definition lists, because it piggybacks on
