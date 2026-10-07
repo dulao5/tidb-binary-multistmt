@@ -190,6 +190,12 @@ reason about here.
   encrypted — a hard protocol break. Only use this package against
   connections that don't require TLS (e.g. a private-network link) until
   this is fixed.
+- **MySQL protocol compression (`compress=true`) is not supported either,
+  for the same reason as TLS** — the dial-hook hijack captures the net.Conn
+  before go-sql-driver/mysql would apply compression framing during the
+  handshake, so this package's raw `readPacket`/`writePacket` would desync
+  against a compressed stream the same way they would against a TLS one.
+  Paused alongside TLS; don't use `compress=true` until this is addressed.
 - **No `COM_STMT_SEND_LONG_DATA` support.** Every parameter value must fit
   in a single packet (`maxPacketPayload`, ~16MB) — there's no fallback for
   larger values the way go-sql-driver/mysql has. In practice this is a very
