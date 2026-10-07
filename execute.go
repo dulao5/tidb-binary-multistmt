@@ -267,8 +267,14 @@ func drainExecuteResponse(raw io.Reader, hasResultSet bool) (*ResultSet, error) 
 		return nil, nil
 	}
 
+	// columnCount comes straight off the wire — do not use it to pre-size
+	// cols (make([]Column, 0, columnCount) panics with "cap out of range"
+	// for a maliciously/accidentally huge value; found by FuzzDrainExecuteResponse).
+	// It's still safe as the loop bound below: a bogus huge count just
+	// means the loop runs until the next readPacket call hits EOF/an error
+	// on the exhausted stream, same as any other truncated-input case.
 	columnCount := readLenEncInt(resp)
-	cols := make([]Column, 0, columnCount)
+	var cols []Column
 	for i := uint64(0); i < columnCount; i++ {
 		defPkt, err := readPacket(raw)
 		if err != nil {

@@ -160,3 +160,45 @@ func TestIntegration_SelectDoesNotDesyncLaterStatements(t *testing.T) {
 		t.Fatalf("expected 4 rows after the batch, got %d — likely a response desync from the SELECTs", got)
 	}
 }
+
+// TestIntegration_SyntaxErrorFailsOnlyThatStatement confirms a PREPARE-time
+// failure (a malformed statement, as opposed to the runtime duplicate-key
+// failure TestIntegration_FailureLeavesTransactionOpenForCallerRollback
+// covers) is reported precisely — Execute itself returns a non-nil error
+// (prepare happens before anything is pipelined, so this is correctly a
+// connection-usable "this one statement's SQL is bad" error, not a
+// protocol-level one) and conn is still perfectly usable afterward.
+func TestIntegration_SyntaxErrorFailsOnlyThatStatement(t *testing.T) {
+	dsn := testDSN(t)
+	setupTable(t, dsn, "tbms_syntax_error")
+
+	ctx := context.Background()
+	conn, err := Dial(ctx, dsn)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	bad := NewBatch()
+	bad.Add("INSERT INTO tbms_syntax_error (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, false)
+	bad.Add("THIS IS NOT VALID SQL (?, ?)", []any{int64(2), "bad"}, false)
+
+	if _, err := conn.Execute(ctx, bad); err == nil {
+		t.Fatalf("expected Execute to fail on the malformed statement")
+	}
+
+	// conn must still be usable: the failure happened during prepare, before
+	// BEGIN was ever sent, so there's no stray open transaction to clean up.
+	good := NewBatch()
+	good.Add("INSERT INTO tbms_syntax_error (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, false)
+	res, err := conn.Execute(ctx, good)
+	if err != nil {
+		t.Fatalf("Execute after a prior syntax error: %v", err)
+	}
+	if !res.AllSucceeded {
+		t.Fatalf("expected success, got %+v", res.Results)
+	}
+	if got, want := rowCount(t, dsn, "tbms_syntax_error"), 1; got != want {
+		t.Fatalf("expected 1 row, got %d", got)
+	}
+}

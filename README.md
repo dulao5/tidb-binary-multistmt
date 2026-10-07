@@ -166,6 +166,15 @@ type (including an unsigned max value and a microsecond-precision
 column metadata and row bytes TiDB actually sends, not hand-crafted
 fixtures.
 
+Every entry point that parses bytes coming off the wire (`readPacket`,
+`decodeColumnDef`, `decodeBinaryRow`, `drainExecuteResponse`,
+`readOKorErr`) has a Go native fuzz target (`fuzz_test.go`) — CI runs each
+briefly on every push, and the full corpus (including past crashers) is
+replayed as ordinary deterministic tests on every `go test`. Fuzzing already
+found and fixed one real bug this way: an untrusted column count was used
+directly as a slice-capacity argument, panicking with "cap out of range" on
+a maliciously/accidentally huge value.
+
 Parameter binding uses genuine `COM_STMT_EXECUTE` binary protocol
 parameters throughout — including through `ExpandIn`/`ExpandValues` — never
 string-literal substitution, so (unlike tidb-multistmt's text-protocol
@@ -197,9 +206,6 @@ reason about here.
   vendor a different (or future) go-sql-driver/mysql version that *does*
   start negotiating deprecate-EOF, check this before relying on this
   package — the failure mode is a silent parse desync, not a loud error.
-- **No fuzzing of the response parser yet** — unit and integration tests
-  exist (including deliberately malformed/truncated packets), but nothing
-  automated throwing arbitrary byte sequences at it.
 
 ## License
 
