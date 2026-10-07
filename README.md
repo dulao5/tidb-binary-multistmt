@@ -119,10 +119,11 @@ in the middle of a batch doesn't desync the statements after it.
   encrypted — a hard protocol break. Only use this package against
   connections that don't require TLS (e.g. a private-network link) until
   this is fixed.
-- **Parameter types**: only `int64`, `int`, `string` (capped at 250 bytes —
-  longer values error out instead of using a real length-encoded integer),
-  and `nil` are supported. No `float64`, `bool`, `time.Time`, `[]byte`,
-  unsigned integers, or `driver.Valuer` yet.
+- **No `COM_STMT_SEND_LONG_DATA` support.** Every parameter value must fit
+  in a single packet (`maxPacketPayload`, ~16MB) — there's no fallback for
+  larger values the way go-sql-driver/mysql has. In practice this is a very
+  generous ceiling for normal column values; it only matters for genuinely
+  large BLOBs/TEXT.
 - **No `WHERE ... IN (?)` / bulk `INSERT` convenience helpers** yet (the
   `ExpandIn`/`ExpandValues` equivalents tidb-multistmt has).
 - **Result sets are not decoded.** A `SELECT`'s binary row packets are

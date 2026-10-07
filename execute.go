@@ -2,10 +2,13 @@ package binarymultistmt
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"time"
 )
 
 // SQLError distinguishes a server-reported SQL-level failure (an ERR packet
@@ -95,10 +98,63 @@ func (c *Conn) prepare(sqlText string, hasResultSet bool) (preparedStmt, error) 
 	return ps, nil
 }
 
+// binTimeLayout is how time.Time args are sent: as a fieldString-typed
+// value, not MySQL's native packed DATE/DATETIME/TIMESTAMP binary struct.
+// The server accepts a string in this position for a date/time column (it
+// parses it the same way it would a text-protocol literal), which is far
+// simpler than implementing the packed struct and costs nothing in
+// practice for this package's use case.
+const binTimeLayout = "2006-01-02 15:04:05.000000"
+
+// appendIntValue appends v as a signed fieldLongLong value/type pair.
+func appendIntValue(types, values []byte, v int64) ([]byte, []byte) {
+	types = append(types, fieldLongLong, 0x00)
+	values = binary.LittleEndian.AppendUint64(values, uint64(v))
+	return types, values
+}
+
+// appendUintValue appends v as an unsigned fieldLongLong value/type pair
+// (the unsigned flag is OR'd into the type's high byte, per the protocol).
+func appendUintValue(types, values []byte, v uint64) ([]byte, []byte) {
+	types = append(types, fieldLongLong, fieldUnsignedFlag)
+	values = binary.LittleEndian.AppendUint64(values, v)
+	return types, values
+}
+
+// appendBytesValue appends v as a fieldString-typed, length-encoded value —
+// used for both string and []byte args (MySQL's binary protocol doesn't
+// distinguish them in parameter position; the column's own declared type on
+// the server side governs how the bytes are interpreted).
+func appendBytesValue(types, values []byte, v []byte) ([]byte, []byte) {
+	types = append(types, fieldString, 0x00)
+	values = appendLenEncInt(values, uint64(len(v)))
+	values = append(values, v...)
+	return types, values
+}
+
+// valueOf resolves a driver.Valuer to its underlying value before the type
+// switch below sees it, same as database/sql itself does.
+func valueOf(a any) (any, error) {
+	if dv, ok := a.(driver.Valuer); ok {
+		v, err := dv.Value()
+		if err != nil {
+			return nil, fmt.Errorf("driver.Valuer.Value: %w", err)
+		}
+		return v, nil
+	}
+	return a, nil
+}
+
 // buildExecutePayload encodes a COM_STMT_EXECUTE for stmtID, binding args in
-// order. Supports int64, int, string, and nil — see the "full parameter
-// type support" issue for the rest of database/sql/driver.Value's type
-// surface.
+// order. Supports nil, bool, every sized int/uint (unsigned gets the
+// protocol's unsigned type flag), float32/64, string, []byte (both encoded
+// as length-prefixed fieldString values — see appendBytesValue), time.Time
+// (encoded as a formatted string — see binTimeLayout), and driver.Valuer.
+//
+// String/[]byte values are length-encoded per the real MySQL protocol
+// integer encoding (appendLenEncInt) rather than capped at a fixed size;
+// the only hard ceiling is writePacket's maxPacketPayload, since this
+// package doesn't implement COM_STMT_SEND_LONG_DATA.
 func buildExecutePayload(stmtID uint32, args []any) ([]byte, error) {
 	head := make([]byte, 0, 9)
 	var b4 [4]byte
@@ -118,29 +174,60 @@ func buildExecutePayload(stmtID uint32, args []any) ([]byte, error) {
 	values := make([]byte, 0, 64)
 
 	for i, a := range args {
-		switch v := a.(type) {
-		case int64:
-			types = append(types, fieldLongLong, 0x00)
-			var b8 [8]byte
-			binary.LittleEndian.PutUint64(b8[:], uint64(v))
-			values = append(values, b8[:]...)
-		case int:
-			types = append(types, fieldLongLong, 0x00)
-			var b8 [8]byte
-			binary.LittleEndian.PutUint64(b8[:], uint64(int64(v)))
-			values = append(values, b8[:]...)
-		case string:
-			if len(v) >= 251 {
-				return nil, fmt.Errorf("arg %d: string length %d exceeds this version's 1-byte length encoding (see the parameter-type-support issue)", i, len(v))
-			}
-			types = append(types, fieldString, 0x00)
-			values = append(values, byte(len(v)))
-			values = append(values, v...)
+		v, err := valueOf(a)
+		if err != nil {
+			return nil, fmt.Errorf("arg %d: %w", i, err)
+		}
+		switch x := v.(type) {
 		case nil:
 			nullMask[i/8] |= 1 << uint(i%8)
 			types = append(types, fieldNULL, 0x00)
+		case bool:
+			types = append(types, fieldTiny, 0x00)
+			if x {
+				values = append(values, 0x01)
+			} else {
+				values = append(values, 0x00)
+			}
+		case int:
+			types, values = appendIntValue(types, values, int64(x))
+		case int8:
+			types, values = appendIntValue(types, values, int64(x))
+		case int16:
+			types, values = appendIntValue(types, values, int64(x))
+		case int32:
+			types, values = appendIntValue(types, values, int64(x))
+		case int64:
+			types, values = appendIntValue(types, values, x)
+		case uint:
+			types, values = appendUintValue(types, values, uint64(x))
+		case uint8:
+			types, values = appendUintValue(types, values, uint64(x))
+		case uint16:
+			types, values = appendUintValue(types, values, uint64(x))
+		case uint32:
+			types, values = appendUintValue(types, values, uint64(x))
+		case uint64:
+			types, values = appendUintValue(types, values, x)
+		case float32:
+			types = append(types, fieldDouble, 0x00)
+			values = binary.LittleEndian.AppendUint64(values, math.Float64bits(float64(x)))
+		case float64:
+			types = append(types, fieldDouble, 0x00)
+			values = binary.LittleEndian.AppendUint64(values, math.Float64bits(x))
+		case string:
+			types, values = appendBytesValue(types, values, []byte(x))
+		case []byte:
+			if x == nil {
+				nullMask[i/8] |= 1 << uint(i%8)
+				types = append(types, fieldNULL, 0x00)
+				continue
+			}
+			types, values = appendBytesValue(types, values, x)
+		case time.Time:
+			types, values = appendBytesValue(types, values, []byte(x.Format(binTimeLayout)))
 		default:
-			return nil, fmt.Errorf("arg %d: unsupported type %T (see the parameter-type-support issue)", i, a)
+			return nil, fmt.Errorf("arg %d: unsupported type %T (not in database/sql/driver.Value's set and doesn't implement driver.Valuer)", i, a)
 		}
 	}
 
