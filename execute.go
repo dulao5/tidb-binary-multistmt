@@ -356,24 +356,32 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 	for i, s := range stmts {
 		ps, err := c.prepare(s.SQL, s.HasResultSet)
 		if err != nil {
+			c.broken = true
 			return nil, fmt.Errorf("prepare statement #%d (%s): %w", i, s.SQL, err)
 		}
 		ids[i] = ps.id
 	}
 
 	if err := writeComQuery(c.raw, "BEGIN"); err != nil {
+		c.broken = true
 		return nil, fmt.Errorf("write BEGIN: %w", err)
 	}
 	if err := readOKorErr(c.raw); err != nil {
+		c.broken = true
 		return nil, fmt.Errorf("BEGIN failed: %w", err)
 	}
 
 	for i, s := range stmts {
 		payload, err := buildExecutePayload(ids[i], s.Args)
 		if err != nil {
+			// Nothing has been written to the wire for this statement yet
+			// (buildExecutePayload is pure encoding), so the connection
+			// itself is still in sync — unlike the write/read failures
+			// below, this doesn't need c.broken.
 			return nil, fmt.Errorf("encode exec #%d (%s): %w", i, s.SQL, err)
 		}
 		if err := writePacket(c.raw, payload); err != nil {
+			c.broken = true
 			return nil, fmt.Errorf("write exec #%d: %w", i, err)
 		}
 	}
@@ -390,6 +398,7 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 				// response-stream alignment for the remaining statements,
 				// and sending COMMIT/ROLLBACK on a connection in this state
 				// is unsafe. Abort.
+				c.broken = true
 				return nil, fmt.Errorf("reading response #%d: %w", i, err)
 			}
 			allOK = false
@@ -398,9 +407,11 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 
 	if allOK {
 		if err := writeComQuery(c.raw, "COMMIT"); err != nil {
+			c.broken = true
 			return nil, fmt.Errorf("write COMMIT: %w", err)
 		}
 		if err := readOKorErr(c.raw); err != nil {
+			c.broken = true
 			return nil, fmt.Errorf("COMMIT failed: %w", err)
 		}
 	}
@@ -412,7 +423,12 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 // ExecuteResult with AllSucceeded false, before reusing c for another Batch.
 func (c *Conn) Rollback(ctx context.Context) error {
 	if err := writeComQuery(c.raw, "ROLLBACK"); err != nil {
+		c.broken = true
 		return fmt.Errorf("write ROLLBACK: %w", err)
 	}
-	return readOKorErr(c.raw)
+	if err := readOKorErr(c.raw); err != nil {
+		c.broken = true
+		return err
+	}
+	return nil
 }

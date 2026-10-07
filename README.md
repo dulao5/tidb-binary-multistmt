@@ -114,6 +114,66 @@ for _, r := range res.Results {
   must already be held as each statement runs, not deferred to commit, for
   "any failure → roll back everything" to stay correct.
 
+### Connection pool (`DB`/`AcquireConn`)
+
+`Dial` hands out one dedicated connection per call — fine for a short-lived
+tool, wasteful for a long-running process that wants to pay the dial+auth
+cost once and reuse connections across many batches. `Open`/`AcquireConn`
+do that:
+
+```go
+db, err := binarymultistmt.Open("user:pass@tcp(host:4000)/db", 40) // maxConns
+if err != nil { ... }
+defer db.Close()
+
+conn, err := db.AcquireConn(ctx) // reuses an idle one, or dials fresh if under maxConns
+if err != nil { ... }
+defer conn.Close() // returns conn to db's idle pool — or discards it, see below
+
+b := binarymultistmt.NewBatch()
+b.Add(...)
+res, err := conn.Execute(ctx, b)
+```
+
+`conn.Close()` here does not close the socket: it returns `conn` to `db`'s
+own idle list for the next `AcquireConn` call to reuse — unless `conn`
+suffered a connection/protocol-level failure (the same failures the `Dial`
+usage above tells you to discard the connection for), in which case `Close`
+destroys it instead, automatically, based on the `Conn`'s own internal
+bookkeeping. Either way, call `Close` exactly once and don't use `conn`
+afterward — same contract as a `Dial`-sourced `Conn`.
+
+This pool is deliberately not `database/sql`'s own connection pool: this
+package needs to know, with certainty, which physical connection it's about
+to speak raw binary protocol on, and `database/sql`'s pool has no API to
+tell a caller that up front for a connection it's reusing from its idle
+list. So the underlying `*sql.DB` inside `DB` is used only to dial and
+authenticate new physical connections; `AcquireConn`/`Close` implement
+their own idle-list reuse on top, where "is this the same physical
+connection as last time" is never in question because this package itself
+decides which `Conn` to hand back out.
+
+If your program already has other code constructing its own `*sql.DB` the
+normal way, build it alongside — not from — a `binarymultistmt.DB`: the two
+are separate, independently-dialed connection pools, not two views onto one
+pool, and `*binarymultistmt.DB` is not a `*sql.DB` (doesn't embed one, isn't
+assignable to a `*sql.DB`-typed parameter/field). A typical setup has a
+factory function returning both from one dsn:
+
+```go
+func NewPools(dsn string) (plain *sql.DB, binary *binarymultistmt.DB, err error) {
+    plain, err = sql.Open("mysql", dsn)
+    if err != nil { return nil, nil, err }
+    binary, err = binarymultistmt.Open(dsn, 40)
+    if err != nil { plain.Close(); return nil, nil, err }
+    return plain, binary, nil
+}
+```
+
+so most of the codebase keeps using `plain` (and its existing call sites
+don't change at all), while the specific code path that wants pipelined
+binary batches uses `binary.AcquireConn` instead.
+
 ### Result sets
 
 `StatementResult.Result` (`*ResultSet`) is set for a successful row-returning

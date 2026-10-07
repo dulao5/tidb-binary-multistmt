@@ -26,6 +26,7 @@ package binarymultistmt
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"net"
 	"strconv"
 	"strings"
@@ -49,7 +50,9 @@ func dialNetworkName() string {
 // concurrent use — mirrors a single *sql.Conn's single-writer assumption.
 type Conn struct {
 	raw       net.Conn
-	db        *sql.DB
+	db        *sql.DB // set only for a Dial-sourced Conn; see Close
+	pool      *DB     // set only for an AcquireConn-sourced Conn; see Close
+	broken    bool    // set on any connection/protocol-level failure — see execute.go
 	poolConn  *sql.Conn
 	stmtCache map[string]preparedStmt
 }
@@ -113,13 +116,35 @@ func Dial(ctx context.Context, dsn string) (*Conn, error) {
 	}, nil
 }
 
-// Close releases the connection. After Close, the Conn must not be used.
-func (c *Conn) Close() error {
+// destroy physically closes c: the raw socket, and (via driver.ErrBadConn)
+// tells database/sql to drop poolConn rather than return it to any pool.
+func (c *Conn) destroy() error {
 	if c.raw != nil {
 		c.raw.Close()
 	}
-	if c.db != nil {
-		return c.db.Close()
+	if c.poolConn != nil {
+		c.poolConn.Raw(func(driverConn any) error { return driver.ErrBadConn })
+		return c.poolConn.Close()
 	}
 	return nil
+}
+
+// Close releases c. For a Dial-sourced Conn this destroys the connection
+// and its dedicated factory *sql.DB. For an AcquireConn-sourced Conn, it
+// instead returns c to its DB's own idle pool for reuse by a later
+// AcquireConn call — unless c suffered a connection/protocol-level failure
+// (see Execute/Rollback's doc comments), in which case it is destroyed
+// instead. Either way, c must not be used after Close.
+func (c *Conn) Close() error {
+	if c.pool != nil {
+		c.pool.release(c, c.broken)
+		return nil
+	}
+	err := c.destroy()
+	if c.db != nil {
+		if cerr := c.db.Close(); err == nil {
+			err = cerr
+		}
+	}
+	return err
 }
