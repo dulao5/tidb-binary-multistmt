@@ -101,14 +101,44 @@ if !res.AllSucceeded {
   must already be held as each statement runs, not deferred to commit, for
   "any failure → roll back everything" to stay correct.
 
+### `WHERE id IN (?)` / bulk `INSERT`
+
+Same two functions as tidb-multistmt, same calling convention — call before
+`Batch.Add`:
+
+```go
+sql, args, err := binarymultistmt.ExpandIn("SELECT c FROM t WHERE id IN (?)", []any{ids})
+b.Add(sql, args, true)
+
+sql, args, err := binarymultistmt.ExpandValues("INSERT INTO t (id, c) VALUES (?, ?)", rows)
+b.Add(sql, args, false)
+```
+
+As with tidb-multistmt, a variable-length `IN` list changes the rendered SQL
+text (and therefore this package's internal PREPARE cache key) with the
+list's length, so a call site whose length jitters a lot gets little benefit
+from PREPARE reuse — pad to a fixed set of bucket sizes yourself if that
+matters for your workload.
+
 ## Status
 
 Experimental, ported from a benchmark originally embedded in
 [database_workload](https://github.com/dulao5/database_workload). Verified
 against a real TiDB (v8.5.8): pipelined inserts commit correctly, a
 duplicate-key failure mid-batch is attributed to the right statement index
-and leaves the transaction open for the caller's `Rollback`, and a `SELECT`
-in the middle of a batch doesn't desync the statements after it.
+and leaves the transaction open for the caller's `Rollback`, a `SELECT` in
+the middle of a batch doesn't desync the statements after it, every
+supported parameter type round-trips correctly (read back through a normal
+driver connection, confirming TiDB itself understood the encoded values —
+not just that this package's own encode/decode is self-consistent), and
+`ExpandIn`/`ExpandValues` compose correctly with the pipelined-binary
+execution path end to end.
+
+Parameter binding uses genuine `COM_STMT_EXECUTE` binary protocol
+parameters throughout — including through `ExpandIn`/`ExpandValues` — never
+string-literal substitution, so (unlike tidb-multistmt's text-protocol
+`SET`-literal mechanism) there is no escaping-based injection surface to
+reason about here.
 
 **Known limitations** (tracked as issues in this repo):
 
@@ -124,13 +154,9 @@ in the middle of a batch doesn't desync the statements after it.
   larger values the way go-sql-driver/mysql has. In practice this is a very
   generous ceiling for normal column values; it only matters for genuinely
   large BLOBs/TEXT.
-- **No `WHERE ... IN (?)` / bulk `INSERT` convenience helpers** yet (the
-  `ExpandIn`/`ExpandValues` equivalents tidb-multistmt has).
 - **Result sets are not decoded.** A `SELECT`'s binary row packets are
   skipped (just enough parsing to stay aligned with the next statement's
   response), not turned into usable data.
-- **No bounds-checking on response parsing.** A short/malformed packet from
-  the server can panic instead of returning an error.
 - **Assumes `CLIENT_DEPRECATE_EOF` is never negotiated.** This package's
   `PREPARE`/`EXECUTE` response parsing expects EOF packets after
   param-definition and column-definition lists, because it piggybacks on
@@ -142,8 +168,9 @@ in the middle of a batch doesn't desync the statements after it.
   vendor a different (or future) go-sql-driver/mysql version that *does*
   start negotiating deprecate-EOF, check this before relying on this
   package — the failure mode is a silent parse desync, not a loud error.
-- **No automated test suite beyond the integration tests above** — no unit
-  tests for the wire-format encoding, no fuzzing of the response parser.
+- **No fuzzing of the response parser yet** — unit and integration tests
+  exist (including deliberately malformed/truncated packets), but nothing
+  automated throwing arbitrary byte sequences at it.
 
 ## License
 
