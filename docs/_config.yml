@@ -1,0 +1,3 @@
+theme: jekyll-theme-minimal
+title: tidb-binary-multistmt
+description: Pipelines a transaction's statements over MySQL's binary protocol with no per-statement round trip.
