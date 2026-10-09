@@ -76,12 +76,19 @@ b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, func(sr *binarymult
 })
 
 res, err := conn.Execute(ctx, b)
-if err != nil {
+var commitErr *binarymultistmt.CommitError
+switch {
+case errors.As(err, &commitErr):
+    // Every statement succeeded, but COMMIT itself was rejected (e.g. a
+    // write conflict) — TiDB already rolled back server-side, so conn is
+    // still healthy and there's nothing to Rollback. Decide whether to
+    // retry the whole batch.
+    log.Println("commit rejected, already rolled back:", commitErr)
+case err != nil:
     // connection/protocol-level failure — conn is no longer usable, Close it
     conn.Close()
     return err
-}
-if !res.AllSucceeded {
+case !res.AllSucceeded:
     for _, f := range failed {
         log.Println("failed:", f)
     }
@@ -89,9 +96,9 @@ if !res.AllSucceeded {
     // Decide what to do (roll back, inspect further, retry) and act
     // explicitly:
     if err := conn.Rollback(ctx); err != nil { ... }
-    return
+default:
+    // every statement succeeded — Execute already sent COMMIT.
 }
-// every statement succeeded — Execute already sent COMMIT.
 ```
 
 - Whether a statement is row-returning is detected automatically, from the
@@ -109,8 +116,15 @@ if !res.AllSucceeded {
   mirrors tidb-multistmt's own library/caller split: that library never
   sends `ROLLBACK` either; its caller does.
 - A connection/protocol-level failure (as opposed to one statement's SQL
-  error) makes `Execute` return a non-nil `error` and leaves `conn` unusable
-  — `Close` it and `Dial` a new one.
+  error or a `*CommitError`, below) makes `Execute` return a non-nil `error`
+  and leaves `conn` unusable — `Close` it and `Dial` a new one.
+- If every statement succeeds but the server then rejects `COMMIT` itself
+  (verified against a real conflict: TiDB already rolls the transaction back
+  server-side when this happens), `Execute` returns a non-nil `*CommitError`
+  (check with `errors.As`) alongside an `ExecuteResult` with `AllSucceeded`
+  false — `conn` is unaffected and stays usable, and there is nothing to
+  `Rollback`. This is a third, distinct outcome from "one statement failed"
+  and "the connection broke" — don't lump it in with either.
 - Only pessimistic transactions are supported, by design — **not** a
   temporary gap. A mid-pipeline failure does not stop already-written
   `EXECUTE`s from running (each is an independent command to the server — it
@@ -138,7 +152,8 @@ res, err := conn.ExecuteAutoCommit(ctx, b)
 
 There is nothing to roll back afterward — **never call `Rollback` after
 `ExecuteAutoCommit`**; whatever already executed is already durable,
-successful or not. This fits a read-only batch, or one where a partial/
+successful or not. `*CommitError` cannot happen here either, since there's
+no `COMMIT` to reject. This fits a read-only batch, or one where a partial/
 failed write genuinely doesn't need undoing (e.g. best-effort logging).
 Anything that needs "every statement in this batch lands, or none do" must
 use `Execute` instead — that's still the right default when in doubt.
@@ -297,7 +312,11 @@ type (including an unsigned max value and a microsecond-precision
 column metadata and row bytes TiDB actually sends, not hand-crafted
 fixtures. `ExecuteAutoCommit` is verified too: a later statement's failure
 does not roll back an earlier statement in the same batch, because there
-was never a transaction to roll back.
+was never a transaction to roll back. `*CommitError` is verified against a
+genuine write conflict (two Conns racing an `UPDATE` under TiDB's optimistic
+transaction mode): the losing `Conn`'s `Execute` returns a `*CommitError`,
+and that same `Conn` is then confirmed still usable for another `Execute`
+call — no Close/Dial or Rollback needed.
 
 Every entry point that parses bytes coming off the wire (`readPacket`,
 `decodeColumnDef`, `decodeBinaryRow`, `drainExecuteResponse`,

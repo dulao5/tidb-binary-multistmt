@@ -21,6 +21,30 @@ type SQLError struct {
 
 func (e *SQLError) Error() string { return e.msg }
 
+// CommitError reports that COMMIT itself was rejected by the server after
+// every statement in the batch individually reported success — as opposed
+// to one of the batch's statements failing (that always surfaces as a
+// *SQLError delivered to that statement's own Callback instead). This can
+// happen even though this package only supports pessimistic transactions —
+// e.g. a prewrite-time write conflict, a concurrent schema change
+// invalidating the transaction, or the GC lifetime being exceeded.
+//
+// TiDB/MySQL already aborts the transaction server-side when this happens:
+// verified empirically (two sessions racing an optimistic-mode write
+// conflict) that a session whose COMMIT was just rejected behaves exactly
+// as if ROLLBACK had already run — a fresh statement on it immediately
+// succeeds under autocommit, with no explicit Rollback call needed or
+// correct. c itself is unaffected by a *CommitError and stays usable; do
+// not Close it, and do not call Rollback, because of one alone.
+type CommitError struct {
+	// Err is the underlying error COMMIT's response reported — typically a
+	// *SQLError.
+	Err error
+}
+
+func (e *CommitError) Error() string { return fmt.Sprintf("commit failed: %v", e.Err) }
+func (e *CommitError) Unwrap() error { return e.Err }
+
 // StatementResult is one Batch statement's outcome, delivered to its
 // Callback — see Statement.Callback. There is no other way to read a
 // statement's result: Conn.Execute keeps no per-statement record after the
@@ -382,6 +406,11 @@ func writeComQuery(w io.Writer, text string) error {
 	return writePacket(w, append([]byte{comQuery}, text...))
 }
 
+// readOKorErr reads one OK/ERR-only response (used for BEGIN/COMMIT/
+// ROLLBACK, none of which return rows). An ERR packet is a *SQLError — the
+// wire protocol round-tripped fine, the server just rejected the command —
+// distinguishable via errors.As from a connection/protocol-level failure
+// (a read error, or a malformed/unexpected packet).
 func readOKorErr(raw io.Reader) error {
 	resp, err := readPacket(raw)
 	if err != nil {
@@ -391,7 +420,7 @@ func readOKorErr(raw io.Reader) error {
 		return fmt.Errorf("empty response packet")
 	}
 	if resp[0] == 0xFF {
-		return fmt.Errorf("ERR: %s", errPacketText(resp))
+		return &SQLError{msg: errPacketText(resp)}
 	}
 	if resp[0] != 0x00 {
 		return fmt.Errorf("expected OK, got first byte 0x%02x", resp[0])
@@ -406,9 +435,15 @@ func readOKorErr(raw io.Reader) error {
 // ROLLBACK — the transaction is left open on c, and the caller must
 // explicitly call c.Rollback (or otherwise resolve it) before reusing c.
 //
+// If every statement succeeded but COMMIT itself is then rejected by the
+// server, Execute returns a non-nil *CommitError (check with errors.As)
+// alongside an ExecuteResult with AllSucceeded false — see CommitError's
+// doc comment for why c stays healthy and reusable in that case, and why
+// Rollback neither applies nor is needed.
+//
 // A connection/protocol-level failure (as opposed to a per-statement
-// SQL-level ERR) returns a non-nil error and leaves c unusable — the caller
-// must Close it and Dial a new one.
+// SQL-level ERR or a *CommitError) returns a non-nil error and leaves c
+// unusable — the caller must Close it and Dial a new one.
 //
 // Only pessimistic transactions make sense here: a mid-pipeline failure
 // does not stop already-written EXECUTEs from running (each is an
@@ -534,6 +569,16 @@ func (c *Conn) execute(ctx context.Context, b *Batch, explicitTxn bool) (*Execut
 			return nil, fmt.Errorf("write COMMIT: %w", err)
 		}
 		if err := readOKorErr(c.raw); err != nil {
+			var sqlErr *SQLError
+			if errors.As(err, &sqlErr) {
+				// The wire round-tripped fine; the server rejected COMMIT
+				// itself and has already rolled back server-side (see
+				// CommitError's doc comment) — c is healthy, only the
+				// batch's net effect didn't land.
+				return &ExecuteResult{AllSucceeded: false}, &CommitError{Err: sqlErr}
+			}
+			// A genuine protocol-level failure reading COMMIT's response —
+			// the wire could be desynced. Discard c.
 			c.broken = true
 			return nil, fmt.Errorf("COMMIT failed: %w", err)
 		}
@@ -544,7 +589,10 @@ func (c *Conn) execute(ctx context.Context, b *Batch, explicitTxn bool) (*Execut
 
 // Rollback sends ROLLBACK on c. Call this after Execute (not
 // ExecuteAutoCommit, which has no transaction to roll back) returns an
-// ExecuteResult with AllSucceeded false, before reusing c for another Batch.
+// ExecuteResult with AllSucceeded false AND a nil error (i.e. one of the
+// batch's statements failed) — before reusing c for another Batch. Do not
+// call it after a *CommitError: TiDB already rolled back server-side when
+// COMMIT was rejected, so there is nothing left to roll back.
 func (c *Conn) Rollback(ctx context.Context) error {
 	if err := writeComQuery(c.raw, "ROLLBACK"); err != nil {
 		c.broken = true

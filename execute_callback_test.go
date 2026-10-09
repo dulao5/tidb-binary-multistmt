@@ -260,3 +260,44 @@ func TestExecuteAutoCommit_SkipsBeginAndCommit(t *testing.T) {
 		t.Fatalf("expected the command right after PREPARE to be COM_STMT_EXECUTE (0x%02x), got 0x%02x — ExecuteAutoCommit must not send BEGIN", comStmtExecute, gotOpcode)
 	}
 }
+
+// TestExecute_CommitRejectionReturnsCommitErrorAndKeepsConnHealthy confirms
+// that when every statement succeeds but the server then rejects COMMIT
+// itself (e.g. a write conflict), Execute reports it as a distinguishable
+// *CommitError rather than lumping it in with a genuine connection/
+// protocol-level failure — and, critically, does NOT mark c broken, since
+// an ERR response to COMMIT means the wire round-tripped fine.
+func TestExecute_CommitRejectionReturnsCommitErrorAndKeepsConnHealthy(t *testing.T) {
+	client, server := pipePair(t)
+	go func() {
+		readPacket(server) // drain COM_STMT_PREPARE
+		writeRawPacket(server, 0, buildPrepareOKPacket(1, 0, 0))
+
+		readPacket(server) // BEGIN
+		writeRawPacket(server, 0, []byte{0x00})
+
+		readPacket(server)                      // EXECUTE
+		writeRawPacket(server, 0, []byte{0x00}) // OK — the statement itself succeeded
+
+		readPacket(server) // COMMIT
+		writeRawPacket(server, 0, buildErrPacket(9007, "Write conflict"))
+	}()
+
+	c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
+	b := NewBatch().Add("INSERT INTO t VALUES (1)", nil, nil)
+	res, err := c.Execute(context.Background(), b)
+
+	var commitErr *CommitError
+	if !errors.As(err, &commitErr) {
+		t.Fatalf("expected a *CommitError, got %v", err)
+	}
+	if commitErr.Err == nil {
+		t.Fatalf("expected CommitError.Err to be set")
+	}
+	if res == nil || res.AllSucceeded {
+		t.Fatalf("expected a non-nil ExecuteResult with AllSucceeded false, got %+v", res)
+	}
+	if c.broken {
+		t.Fatalf("expected c to remain usable after a *CommitError — COMMIT's ERR response means the wire round-tripped fine")
+	}
+}

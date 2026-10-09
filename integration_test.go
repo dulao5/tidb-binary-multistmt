@@ -5,8 +5,11 @@ package binarymultistmt
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -255,5 +258,103 @@ func TestIntegration_AutoCommitDoesNotRollBackEarlierStatements(t *testing.T) {
 	// The first INSERT must still be visible.
 	if got, want := rowCount(t, dsn, "tbms_autocommit"), 1; got != want {
 		t.Fatalf("expected the first statement's insert to have committed on its own despite the second failing, got %d rows", got)
+	}
+}
+
+// withOptimisticTxnMode appends a tidb_txn_mode=optimistic system-variable
+// param to dsn — go-sql-driver/mysql executes unrecognized DSN params as
+// SET session variables right after connecting, so this configures the
+// hijacked connection's session before Dial's handshake even finishes.
+func withOptimisticTxnMode(dsn string) string {
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + "tidb_txn_mode=optimistic"
+}
+
+// TestIntegration_CommitRejectionKeepsConnReusable reproduces a genuine
+// write conflict (two optimistic-mode Conns racing an UPDATE on the same
+// row) and confirms Execute reports it as a *CommitError — not a
+// connection/protocol-level failure — and that the Conn whose COMMIT was
+// rejected is immediately reusable for another Execute call, with no Close/
+// Dial or Rollback needed. The race is timing-dependent, so it retries a
+// few times before giving up; TestExecute_CommitRejectionReturnsCommitErrorAndKeepsConnHealthy
+// covers this package's own handling of a rejected COMMIT deterministically.
+func TestIntegration_CommitRejectionKeepsConnReusable(t *testing.T) {
+	dsn := testDSN(t)
+	setupTable(t, dsn, "tbms_commit_conflict")
+
+	plain, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer plain.Close()
+	if _, err := plain.Exec("INSERT INTO tbms_commit_conflict (id, val) VALUES (1, 'seed')"); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+
+	ctx := context.Background()
+	optimisticDSN := withOptimisticTxnMode(dsn)
+
+	var commitErr *CommitError
+	var usableConn *Conn
+	const maxAttempts = 8
+	for attempt := 0; attempt < maxAttempts && commitErr == nil; attempt++ {
+		connA, err := Dial(ctx, optimisticDSN)
+		if err != nil {
+			t.Fatalf("Dial A: %v", err)
+		}
+		connB, err := Dial(ctx, optimisticDSN)
+		if err != nil {
+			t.Fatalf("Dial B: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		var errA, errB error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			bA := NewBatch().Add("UPDATE tbms_commit_conflict SET val = ? WHERE id = 1", []any{"a"}, nil)
+			_, errA = connA.Execute(ctx, bA)
+		}()
+		go func() {
+			defer wg.Done()
+			bB := NewBatch().Add("UPDATE tbms_commit_conflict SET val = ? WHERE id = 1", []any{"b"}, nil)
+			_, errB = connB.Execute(ctx, bB)
+		}()
+		wg.Wait()
+
+		switch {
+		case errors.As(errA, &commitErr):
+			usableConn = connA
+			connB.Close()
+		case errors.As(errB, &commitErr):
+			usableConn = connB
+			connA.Close()
+		default:
+			connA.Close()
+			connB.Close()
+		}
+	}
+
+	if commitErr == nil {
+		t.Skipf("could not reproduce a real write conflict after %d attempts (timing-dependent)", maxAttempts)
+	}
+	defer usableConn.Close()
+
+	if usableConn.broken {
+		t.Fatalf("expected the Conn whose COMMIT was rejected to remain usable (not broken)")
+	}
+
+	// Prove it for real, not just via the broken flag: run another Execute
+	// on the same Conn and confirm it still works.
+	b2 := NewBatch().Add("INSERT INTO tbms_commit_conflict (id, val) VALUES (?, ?)", []any{int64(2), "after-conflict"}, nil)
+	res2, err2 := usableConn.Execute(ctx, b2)
+	if err2 != nil {
+		t.Fatalf("Execute after *CommitError: %v", err2)
+	}
+	if !res2.AllSucceeded {
+		t.Fatalf("expected the post-conflict Execute to succeed, proving the Conn is genuinely reusable")
 	}
 }

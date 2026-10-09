@@ -29,12 +29,19 @@ b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, func(sr *binarymult
 })
 
 res, err := conn.Execute(ctx, b)
-if err != nil {
+var commitErr *binarymultistmt.CommitError
+switch {
+case errors.As(err, &commitErr):
+    // Every statement succeeded, but COMMIT itself was rejected (e.g. a
+    // write conflict) — TiDB already rolled back server-side, so conn is
+    // still healthy and there's nothing to Rollback. Decide whether to
+    // retry the whole batch.
+    log.Println("commit rejected, already rolled back:", commitErr)
+case err != nil:
     // connection/protocol-level failure — conn is no longer usable, Close it
     conn.Close()
     return err
-}
-if !res.AllSucceeded {
+case !res.AllSucceeded:
     for _, f := range failed {
         log.Println("failed:", f)
     }
@@ -42,9 +49,9 @@ if !res.AllSucceeded {
     // Decide what to do (roll back, inspect further, retry) and act
     // explicitly:
     if err := conn.Rollback(ctx); err != nil { ... }
-    return
+default:
+    // every statement succeeded — Execute already sent COMMIT.
 }
-// every statement succeeded — Execute already sent COMMIT.
 ```
 
 Each statement's error and result arrive through its own `Callback`
@@ -106,9 +113,16 @@ the caller never declares it and can't get it wrong. `Execute` auto-sends
 send `ROLLBACK` — each failing statement's `Callback` already saw the error
 as it happened, and the transaction is left open for the caller to
 explicitly resolve. A connection/protocol-level failure (as opposed to one
-statement's SQL error) makes `Execute` return a non-nil `error` and leaves
-the connection unusable — `Close` it (or let a pooled `Conn`'s own `Close`
-discard it automatically) rather than reusing it.
+statement's SQL error, or a `*CommitError`) makes `Execute` return a non-nil
+`error` and leaves the connection unusable — `Close` it (or let a pooled
+`Conn`'s own `Close` discard it automatically) rather than reusing it.
+
+If every statement succeeds but the server then rejects `COMMIT` itself
+(verified against a real conflict: TiDB already rolls the transaction back
+server-side when this happens), `Execute` returns a non-nil `*CommitError`
+instead — the connection is unaffected and stays usable, and there's
+nothing to `Rollback`. This is a third, distinct outcome from "one statement
+failed" and "the connection broke."
 
 `ExecuteAutoCommit` pipelines the same way but never sends `BEGIN`/`COMMIT`
 — each statement commits on its own, with nothing to `Rollback` afterward.
