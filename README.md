@@ -1,5 +1,7 @@
 # tidb-binary-multistmt
 
+English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
+
 Pipelines a transaction's statements over MySQL's **binary** protocol
 (`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`) with no per-statement network round
 trip, by writing every statement's `EXECUTE` packet back-to-back before
