@@ -222,3 +222,38 @@ func TestIntegration_SyntaxErrorFailsOnlyThatStatement(t *testing.T) {
 		t.Fatalf("expected 1 row, got %d", got)
 	}
 }
+
+// TestIntegration_AutoCommitDoesNotRollBackEarlierStatements confirms
+// ExecuteAutoCommit's core semantic difference from Execute: with no BEGIN,
+// each statement commits independently as it runs, so a later statement's
+// failure does not undo an earlier statement's success — there is nothing
+// to roll back, on purpose.
+func TestIntegration_AutoCommitDoesNotRollBackEarlierStatements(t *testing.T) {
+	dsn := testDSN(t)
+	setupTable(t, dsn, "tbms_autocommit")
+
+	ctx := context.Background()
+	conn, err := Dial(ctx, dsn)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	b := NewBatch()
+	b.Add("INSERT INTO tbms_autocommit (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, nil)
+	b.Add("INSERT INTO tbms_autocommit (id, val) VALUES (?, ?)", []any{int64(1), "dup"}, nil) // duplicate PK
+
+	res, err := conn.ExecuteAutoCommit(ctx, b)
+	if err != nil {
+		t.Fatalf("ExecuteAutoCommit: %v", err)
+	}
+	if res.AllSucceeded {
+		t.Fatalf("expected the duplicate-key insert to fail")
+	}
+
+	// No Rollback call here — ExecuteAutoCommit never opened a transaction.
+	// The first INSERT must still be visible.
+	if got, want := rowCount(t, dsn, "tbms_autocommit"), 1; got != want {
+		t.Fatalf("expected the first statement's insert to have committed on its own despite the second failing, got %d rows", got)
+	}
+}

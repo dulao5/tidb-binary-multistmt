@@ -112,9 +112,21 @@ statement's SQL error) makes `Execute` return a non-nil `error` and leaves
 the connection unusable — `Close` it (or let a pooled `Conn`'s own `Close`
 discard it automatically) rather than reusing it.
 
+`ExecuteAutoCommit` pipelines the same way but never sends `BEGIN`/`COMMIT`
+— each statement commits on its own, with nothing to `Rollback` afterward.
+Use it for a read-only batch, or one where a partial failure genuinely
+doesn't need undoing; `Execute` is still the right default whenever a batch
+needs all-or-nothing atomicity. Only pessimistic transactions are supported,
+by design: optimistic transactions defer conflict detection to `COMMIT`
+time, which would fail a whole batch at once with no way to attribute the
+conflict back to one statement — defeating the per-statement `Callback` this
+package is built around. There is no plan to add optimistic transaction
+support.
+
 See the README's
-[Usage](https://github.com/dulao5/tidb-binary-multistmt#usage) and
-[connection pool](https://github.com/dulao5/tidb-binary-multistmt#connection-pool-dbacquireconn)
+[Usage](https://github.com/dulao5/tidb-binary-multistmt#usage),
+[`ExecuteAutoCommit`](https://github.com/dulao5/tidb-binary-multistmt#executeautocommit-skip-begincommit-entirely),
+and [connection pool](https://github.com/dulao5/tidb-binary-multistmt#connection-pool-dbacquireconn)
 sections for the full runnable examples. The API reference below documents
 each piece individually.
 
@@ -176,6 +188,7 @@ See the package README for status, known limitations \(most notably: TLS is not 
   - [func Dial\(ctx context.Context, dsn string\) \(\*Conn, error\)](<#Dial>)
   - [func \(c \*Conn\) Close\(\) error](<#Conn.Close>)
   - [func \(c \*Conn\) Execute\(ctx context.Context, b \*Batch\) \(\*ExecuteResult, error\)](<#Conn.Execute>)
+  - [func \(c \*Conn\) ExecuteAutoCommit\(ctx context.Context, b \*Batch\) \(\*ExecuteResult, error\)](<#Conn.ExecuteAutoCommit>)
   - [func \(c \*Conn\) Rollback\(ctx context.Context\) error](<#Conn.Rollback>)
 - [type DB](<#DB>)
   - [func Open\(dsn string, maxConns int\) \(\*DB, error\)](<#Open>)
@@ -321,7 +334,7 @@ func (c *Conn) Close() error
 Close releases c. For a Dial\-sourced Conn this destroys the connection and its dedicated factory \*sql.DB. For an AcquireConn\-sourced Conn, it instead returns c to its DB's own idle pool for reuse by a later AcquireConn call — unless c suffered a connection/protocol\-level failure \(see Execute/Rollback's doc comments\), in which case it is destroyed instead. Either way, c must not be used after Close.
 
 <a name="Conn.Execute"></a>
-### func \(\*Conn\) [Execute](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L412>)
+### func \(\*Conn\) [Execute](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L423>)
 
 ```go
 func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error)
@@ -331,14 +344,27 @@ Execute sends BEGIN, writes every statement in b's EXECUTE packet back\-to\-back
 
 A connection/protocol\-level failure \(as opposed to a per\-statement SQL\-level ERR\) returns a non\-nil error and leaves c unusable — the caller must Close it and Dial a new one.
 
+Only pessimistic transactions make sense here: a mid\-pipeline failure does not stop already\-written EXECUTEs from running \(each is an independent command to the server — it has no idea they're "one batch"\), so row locks must already be held as each statement runs, not deferred to commit, for "any failure → roll back everything" to stay correct. Optimistic transactions defer conflict detection to COMMIT \(prewrite\) time — a conflict there fails the whole transaction at once, with no way to attribute it back to the one statement that actually collided, which defeats the per\-statement Callback this package is built around. This package does not support optimistic transactions and has no plans to.
+
+<a name="Conn.ExecuteAutoCommit"></a>
+### func \(\*Conn\) [ExecuteAutoCommit](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L442>)
+
+```go
+func (c *Conn) ExecuteAutoCommit(ctx context.Context, b *Batch) (*ExecuteResult, error)
+```
+
+ExecuteAutoCommit pipelines every statement in b exactly like Execute — preparing any not\-yet\-cached SQL text, writing every EXECUTE back\-to\-back, then reading all responses — but never sends BEGIN or COMMIT. Each statement commits on its own as it executes, the same as issuing them one at a time with no explicit transaction \(MySQL's session\-default autocommit behavior\). There is no transaction to roll back afterward: never call Rollback after ExecuteAutoCommit — whatever already executed is already durable, successful or not.
+
+This trades away the one thing Execute's BEGIN/COMMIT round trips buy — all\-or\-nothing atomicity across the batch — for two fewer round trips per call. It fits a read\-only batch, or one where a partial/failed write genuinely doesn't need undoing \(e.g. best\-effort logging\); anything that needs "every statement in this batch lands, or none do" must use Execute instead.
+
 <a name="Conn.Rollback"></a>
-### func \(\*Conn\) [Rollback](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L509>)
+### func \(\*Conn\) [Rollback](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L548>)
 
 ```go
 func (c *Conn) Rollback(ctx context.Context) error
 ```
 
-Rollback sends ROLLBACK on c. Call this after Execute returns an ExecuteResult with AllSucceeded false, before reusing c for another Batch.
+Rollback sends ROLLBACK on c. Call this after Execute \(not ExecuteAutoCommit, which has no transaction to roll back\) returns an ExecuteResult with AllSucceeded false, before reusing c for another Batch.
 
 <a name="DB"></a>
 ## type [DB](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/db.go#L30-L43>)

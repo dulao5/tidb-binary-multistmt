@@ -409,7 +409,43 @@ func readOKorErr(raw io.Reader) error {
 // A connection/protocol-level failure (as opposed to a per-statement
 // SQL-level ERR) returns a non-nil error and leaves c unusable — the caller
 // must Close it and Dial a new one.
+//
+// Only pessimistic transactions make sense here: a mid-pipeline failure
+// does not stop already-written EXECUTEs from running (each is an
+// independent command to the server — it has no idea they're "one batch"),
+// so row locks must already be held as each statement runs, not deferred to
+// commit, for "any failure → roll back everything" to stay correct.
+// Optimistic transactions defer conflict detection to COMMIT (prewrite)
+// time — a conflict there fails the whole transaction at once, with no way
+// to attribute it back to the one statement that actually collided, which
+// defeats the per-statement Callback this package is built around. This
+// package does not support optimistic transactions and has no plans to.
 func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
+	return c.execute(ctx, b, true)
+}
+
+// ExecuteAutoCommit pipelines every statement in b exactly like Execute —
+// preparing any not-yet-cached SQL text, writing every EXECUTE back-to-back,
+// then reading all responses — but never sends BEGIN or COMMIT. Each
+// statement commits on its own as it executes, the same as issuing them one
+// at a time with no explicit transaction (MySQL's session-default
+// autocommit behavior). There is no transaction to roll back afterward:
+// never call Rollback after ExecuteAutoCommit — whatever already executed
+// is already durable, successful or not.
+//
+// This trades away the one thing Execute's BEGIN/COMMIT round trips buy —
+// all-or-nothing atomicity across the batch — for two fewer round trips per
+// call. It fits a read-only batch, or one where a partial/failed write
+// genuinely doesn't need undoing (e.g. best-effort logging); anything that
+// needs "every statement in this batch lands, or none do" must use Execute
+// instead.
+func (c *Conn) ExecuteAutoCommit(ctx context.Context, b *Batch) (*ExecuteResult, error) {
+	return c.execute(ctx, b, false)
+}
+
+// execute is Execute and ExecuteAutoCommit's shared implementation;
+// explicitTxn selects whether BEGIN/COMMIT wrap the pipelined EXECUTEs.
+func (c *Conn) execute(ctx context.Context, b *Batch, explicitTxn bool) (*ExecuteResult, error) {
 	stmts := b.Statements()
 	if len(stmts) == 0 {
 		return &ExecuteResult{AllSucceeded: true}, nil
@@ -427,13 +463,15 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 		hasResultSet[i] = ps.hasResultSet
 	}
 
-	if err := writeComQuery(c.raw, "BEGIN"); err != nil {
-		c.broken = true
-		return nil, fmt.Errorf("write BEGIN: %w", err)
-	}
-	if err := readOKorErr(c.raw); err != nil {
-		c.broken = true
-		return nil, fmt.Errorf("BEGIN failed: %w", err)
+	if explicitTxn {
+		if err := writeComQuery(c.raw, "BEGIN"); err != nil {
+			c.broken = true
+			return nil, fmt.Errorf("write BEGIN: %w", err)
+		}
+		if err := readOKorErr(c.raw); err != nil {
+			c.broken = true
+			return nil, fmt.Errorf("BEGIN failed: %w", err)
+		}
 	}
 
 	for i, s := range stmts {
@@ -490,7 +528,7 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 		}
 	}
 
-	if allOK {
+	if explicitTxn && allOK {
 		if err := writeComQuery(c.raw, "COMMIT"); err != nil {
 			c.broken = true
 			return nil, fmt.Errorf("write COMMIT: %w", err)
@@ -504,7 +542,8 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 	return &ExecuteResult{AllSucceeded: allOK}, nil
 }
 
-// Rollback sends ROLLBACK on c. Call this after Execute returns an
+// Rollback sends ROLLBACK on c. Call this after Execute (not
+// ExecuteAutoCommit, which has no transaction to roll back) returns an
 // ExecuteResult with AllSucceeded false, before reusing c for another Batch.
 func (c *Conn) Rollback(ctx context.Context) error {
 	if err := writeComQuery(c.raw, "ROLLBACK"); err != nil {

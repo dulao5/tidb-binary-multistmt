@@ -226,3 +226,37 @@ func TestExecute_CallbackFiresExactlyOnce(t *testing.T) {
 		t.Fatalf("expected stmt0's callback to have read exactly row {10} itself, got %v", rowsSeen)
 	}
 }
+
+// TestExecuteAutoCommit_SkipsBeginAndCommit confirms ExecuteAutoCommit never
+// sends BEGIN before pipelining EXECUTEs. Absence of a trailing COMMIT is
+// confirmed implicitly: if ExecuteAutoCommit mistakenly tried to send one,
+// the server goroutine below (which only ever reads PREPARE then EXECUTE)
+// would never consume it, and the client's write would block until
+// pipePair's deadline and surface as a write-timeout error instead of nil.
+func TestExecuteAutoCommit_SkipsBeginAndCommit(t *testing.T) {
+	client, server := pipePair(t)
+	var gotOpcode byte
+	go func() {
+		readPacket(server) // drain COM_STMT_PREPARE
+		writeRawPacket(server, 0, buildPrepareOKPacket(1, 0, 0))
+
+		pkt, _ := readPacket(server) // should be COM_STMT_EXECUTE, not BEGIN's COM_QUERY
+		if len(pkt) > 0 {
+			gotOpcode = pkt[0]
+		}
+		writeRawPacket(server, 0, []byte{0x00}) // OK for the EXECUTE
+	}()
+
+	c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
+	b := NewBatch().Add("INSERT INTO t VALUES (1)", nil, nil)
+	res, err := c.ExecuteAutoCommit(context.Background(), b)
+	if err != nil {
+		t.Fatalf("ExecuteAutoCommit: %v", err)
+	}
+	if !res.AllSucceeded {
+		t.Fatalf("expected success")
+	}
+	if gotOpcode != comStmtExecute {
+		t.Fatalf("expected the command right after PREPARE to be COM_STMT_EXECUTE (0x%02x), got 0x%02x — ExecuteAutoCommit must not send BEGIN", comStmtExecute, gotOpcode)
+	}
+}

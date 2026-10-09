@@ -110,9 +110,21 @@ statement's SQL error) makes `Execute` return a non-nil `error` and leaves
 the connection unusable — `Close` it (or let a pooled `Conn`'s own `Close`
 discard it automatically) rather than reusing it.
 
+`ExecuteAutoCommit` pipelines the same way but never sends `BEGIN`/`COMMIT`
+— each statement commits on its own, with nothing to `Rollback` afterward.
+Use it for a read-only batch, or one where a partial failure genuinely
+doesn't need undoing; `Execute` is still the right default whenever a batch
+needs all-or-nothing atomicity. Only pessimistic transactions are supported,
+by design: optimistic transactions defer conflict detection to `COMMIT`
+time, which would fail a whole batch at once with no way to attribute the
+conflict back to one statement — defeating the per-statement `Callback` this
+package is built around. There is no plan to add optimistic transaction
+support.
+
 See the README's
-[Usage](https://github.com/dulao5/tidb-binary-multistmt#usage) and
-[connection pool](https://github.com/dulao5/tidb-binary-multistmt#connection-pool-dbacquireconn)
+[Usage](https://github.com/dulao5/tidb-binary-multistmt#usage),
+[`ExecuteAutoCommit`](https://github.com/dulao5/tidb-binary-multistmt#executeautocommit-skip-begincommit-entirely),
+and [connection pool](https://github.com/dulao5/tidb-binary-multistmt#connection-pool-dbacquireconn)
 sections for the full runnable examples. The API reference below documents
 each piece individually.
 

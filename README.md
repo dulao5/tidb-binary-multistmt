@@ -111,11 +111,37 @@ if !res.AllSucceeded {
 - A connection/protocol-level failure (as opposed to one statement's SQL
   error) makes `Execute` return a non-nil `error` and leaves `conn` unusable
   — `Close` it and `Dial` a new one.
-- Only pessimistic transactions make sense here: a mid-pipeline failure does
-  not stop already-written `EXECUTE`s from running (each is an independent
-  command to the server — it has no idea they're "one batch"), so row locks
-  must already be held as each statement runs, not deferred to commit, for
-  "any failure → roll back everything" to stay correct.
+- Only pessimistic transactions are supported, by design — **not** a
+  temporary gap. A mid-pipeline failure does not stop already-written
+  `EXECUTE`s from running (each is an independent command to the server — it
+  has no idea they're "one batch"), so row locks must already be held as
+  each statement runs, not deferred to commit, for "any failure → roll back
+  everything" to stay correct. Optimistic transactions defer conflict
+  detection to `COMMIT` (prewrite) time instead: a conflict there fails the
+  whole transaction at once, with no way to attribute it back to the one
+  statement that actually collided — which defeats the per-statement
+  `Callback` this package is built around. There is no plan to add
+  optimistic transaction support.
+
+### `ExecuteAutoCommit`: skip `BEGIN`/`COMMIT` entirely
+
+`Execute` always costs two extra round trips beyond the pipelined
+`EXECUTE`s: a synchronous `BEGIN` before them, and (on full success) a
+synchronous `COMMIT` after. `ExecuteAutoCommit` is the same pipelining with
+neither — each statement commits on its own as it runs, exactly like
+issuing them one at a time with no explicit transaction (MySQL's
+session-default autocommit behavior):
+
+```go
+res, err := conn.ExecuteAutoCommit(ctx, b)
+```
+
+There is nothing to roll back afterward — **never call `Rollback` after
+`ExecuteAutoCommit`**; whatever already executed is already durable,
+successful or not. This fits a read-only batch, or one where a partial/
+failed write genuinely doesn't need undoing (e.g. best-effort logging).
+Anything that needs "every statement in this batch lands, or none do" must
+use `Execute` instead — that's still the right default when in doubt.
 
 ### Connection pool (`DB`/`AcquireConn`)
 
@@ -269,7 +295,9 @@ execution path end to end, and a `SELECT` covering every supported column
 type (including an unsigned max value and a microsecond-precision
 `DATETIME`) decodes correctly through this package's own `RowIterator` —
 column metadata and row bytes TiDB actually sends, not hand-crafted
-fixtures.
+fixtures. `ExecuteAutoCommit` is verified too: a later statement's failure
+does not roll back an earlier statement in the same batch, because there
+was never a transaction to roll back.
 
 Every entry point that parses bytes coming off the wire (`readPacket`,
 `decodeColumnDef`, `decodeBinaryRow`, `drainExecuteResponse`,
