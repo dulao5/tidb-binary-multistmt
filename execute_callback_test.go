@@ -98,15 +98,12 @@ func TestDrainExecuteResponse_CallbackStreamsAndAutoDrains(t *testing.T) {
 		got = it.Next() // read only the first row, leave the rest
 	}
 
-	rs, err := drainExecuteResponse(client, true, cb)
+	err := drainExecuteResponse(client, true, cb)
 	if err != nil {
 		t.Fatalf("drainExecuteResponse: %v", err)
 	}
 	if !cbCalled {
 		t.Fatalf("expected cb to be invoked")
-	}
-	if rs != nil {
-		t.Fatalf("expected a nil *ResultSet when cb is set (no buffering), got %+v", rs)
 	}
 	if len(got) != 1 || got[0].(int64) != 1 {
 		t.Fatalf("expected cb's own Next() to see row {1}, got %v", got)

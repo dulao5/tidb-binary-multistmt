@@ -14,21 +14,27 @@ import (
 // bookkeeping.
 func connectionID(t *testing.T, ctx context.Context, c *Conn) uint64 {
 	t.Helper()
-	b := NewBatch().Add("SELECT CONNECTION_ID()", nil, nil)
+	var id uint64
+	var rowCount int
+	b := NewBatch().Add("SELECT CONNECTION_ID()", nil, func(sr *StatementResult) {
+		for row := sr.Rows.Next(); row != nil; row = sr.Rows.Next() {
+			rowCount++
+			var ok bool
+			id, ok = row[0].(uint64)
+			if !ok {
+				t.Fatalf("expected uint64 connection id, got %T (%v)", row[0], row[0])
+			}
+		}
+	})
 	res, err := c.Execute(ctx, b)
 	if err != nil {
 		t.Fatalf("Execute(SELECT CONNECTION_ID()): %v", err)
 	}
 	if !res.AllSucceeded {
-		t.Fatalf("SELECT CONNECTION_ID() failed: %+v", res.Results)
+		t.Fatalf("SELECT CONNECTION_ID() failed")
 	}
-	rows := res.Results[0].Result.Rows
-	if len(rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(rows))
-	}
-	id, ok := rows[0][0].(uint64)
-	if !ok {
-		t.Fatalf("expected uint64 connection id, got %T (%v)", rows[0][0], rows[0][0])
+	if rowCount != 1 {
+		t.Fatalf("expected 1 row, got %d", rowCount)
 	}
 	return id
 }

@@ -75,7 +75,7 @@ func TestIntegration_PipelinedInsertsCommit(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 	if !res.AllSucceeded {
-		t.Fatalf("expected all statements to succeed, got %+v", res.Results)
+		t.Fatalf("expected all statements to succeed")
 	}
 
 	if got, want := rowCount(t, dsn, "tbms_insert_commit"), 5; got != want {
@@ -94,10 +94,15 @@ func TestIntegration_FailureLeavesTransactionOpenForCallerRollback(t *testing.T)
 	}
 	defer conn.Close()
 
+	var errs [3]error
+	recordErr := func(i int) func(*StatementResult) {
+		return func(sr *StatementResult) { errs[i] = sr.Err }
+	}
+
 	b := NewBatch()
-	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, nil)
-	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(1), "dup"}, nil) // duplicate PK
-	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(2), "after-failure"}, nil)
+	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, recordErr(0))
+	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(1), "dup"}, recordErr(1)) // duplicate PK
+	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(2), "after-failure"}, recordErr(2))
 
 	res, err := conn.Execute(ctx, b)
 	if err != nil {
@@ -106,11 +111,11 @@ func TestIntegration_FailureLeavesTransactionOpenForCallerRollback(t *testing.T)
 	if res.AllSucceeded {
 		t.Fatalf("expected the duplicate-key insert to fail")
 	}
-	if res.Results[1].Err == nil {
+	if errs[1] == nil {
 		t.Fatalf("expected statement #1 (the duplicate) to report an error")
 	}
-	if res.Results[0].Err != nil || res.Results[2].Err != nil {
-		t.Fatalf("expected only statement #1 to fail, got %+v", res.Results)
+	if errs[0] != nil || errs[2] != nil {
+		t.Fatalf("expected only statement #1 to fail, got %+v", errs)
 	}
 
 	// Nothing committed yet — Execute must not have auto-rolled-back either,
@@ -143,17 +148,32 @@ func TestIntegration_SelectDoesNotDesyncLaterStatements(t *testing.T) {
 		t.Fatalf("seed insert failed: err=%v res=%+v", err, res)
 	}
 
+	var firstSelectRows, secondSelectRows int
 	b := NewBatch()
-	b.Add("SELECT val FROM tbms_select_sync WHERE id = ?", []any{int64(1)}, nil)
+	b.Add("SELECT val FROM tbms_select_sync WHERE id = ?", []any{int64(1)}, func(sr *StatementResult) {
+		for row := sr.Rows.Next(); row != nil; row = sr.Rows.Next() {
+			firstSelectRows++
+		}
+	})
 	b.Add("INSERT INTO tbms_select_sync (id, val) VALUES (?, ?)", []any{int64(4), "after-select"}, nil)
-	b.Add("SELECT val FROM tbms_select_sync WHERE id BETWEEN ? AND ?", []any{int64(1), int64(4)}, nil)
+	b.Add("SELECT val FROM tbms_select_sync WHERE id BETWEEN ? AND ?", []any{int64(1), int64(4)}, func(sr *StatementResult) {
+		for row := sr.Rows.Next(); row != nil; row = sr.Rows.Next() {
+			secondSelectRows++
+		}
+	})
 
 	res, err := conn.Execute(ctx, b)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
 	if !res.AllSucceeded {
-		t.Fatalf("expected all statements to succeed, got %+v", res.Results)
+		t.Fatalf("expected all statements to succeed")
+	}
+	if firstSelectRows != 1 {
+		t.Fatalf("expected 1 row from the first SELECT, got %d", firstSelectRows)
+	}
+	if secondSelectRows != 4 {
+		t.Fatalf("expected 4 rows from the second SELECT, got %d — likely a response desync", secondSelectRows)
 	}
 
 	if got, want := rowCount(t, dsn, "tbms_select_sync"), 4; got != want {
@@ -196,7 +216,7 @@ func TestIntegration_SyntaxErrorFailsOnlyThatStatement(t *testing.T) {
 		t.Fatalf("Execute after a prior syntax error: %v", err)
 	}
 	if !res.AllSucceeded {
-		t.Fatalf("expected success, got %+v", res.Results)
+		t.Fatalf("expected success")
 	}
 	if got, want := rowCount(t, dsn, "tbms_syntax_error"), 1; got != want {
 		t.Fatalf("expected 1 row, got %d", got)

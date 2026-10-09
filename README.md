@@ -58,9 +58,22 @@ conn, err := binarymultistmt.Dial(ctx, "user:pass@tcp(host:4000)/db")
 if err != nil { ... }
 defer conn.Close()
 
+var failed []string
 b := binarymultistmt.NewBatch()
-b.Add("INSERT INTO accounts (id, balance) VALUES (?, ?)", []any{1, 100}, nil)
-b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, nil)
+b.Add("INSERT INTO accounts (id, balance) VALUES (?, ?)", []any{1, 100}, func(sr *binarymultistmt.StatementResult) {
+    if sr.Err != nil {
+        failed = append(failed, fmt.Sprintf("#%d (%s): %v", sr.Index, sr.SQL, sr.Err))
+    }
+})
+b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, func(sr *binarymultistmt.StatementResult) {
+    if sr.Err != nil {
+        failed = append(failed, fmt.Sprintf("#%d (%s): %v", sr.Index, sr.SQL, sr.Err))
+        return
+    }
+    for row := sr.Rows.Next(); row != nil; row = sr.Rows.Next() {
+        fmt.Println("balance:", row[0])
+    }
+})
 
 res, err := conn.Execute(ctx, b)
 if err != nil {
@@ -69,10 +82,8 @@ if err != nil {
     return err
 }
 if !res.AllSucceeded {
-    for _, r := range res.Results {
-        if r.Err != nil {
-            log.Printf("statement #%d (%s) failed: %v", r.Index, r.SQL, r.Err)
-        }
+    for _, f := range failed {
+        log.Println("failed:", f)
     }
     // Execute did NOT send ROLLBACK — the transaction is still open on conn.
     // Decide what to do (roll back, inspect further, retry) and act
@@ -81,31 +92,22 @@ if !res.AllSucceeded {
     return
 }
 // every statement succeeded — Execute already sent COMMIT.
-for _, r := range res.Results {
-    if r.Result == nil { // not a row-returning statement
-        continue
-    }
-    for _, col := range r.Result.Columns {
-        fmt.Print(col.Name, "\t")
-    }
-    for _, row := range r.Result.Rows {
-        for _, v := range row {
-            fmt.Print(v, "\t") // nil for SQL NULL
-        }
-    }
-}
 ```
 
 - Whether a statement is row-returning is detected automatically, from the
   server's own `COM_STMT_PREPARE` response (its column-count field is `0`
   for a non-row-returning statement) — unlike tidb-multistmt, the caller
   never declares this and so can't get it wrong.
+- A statement's error and result are only ever visible through its
+  `Callback` (see below) — `Execute` keeps no per-statement record after the
+  batch finishes, so there's exactly one place to look, not two. `ExecuteResult`
+  itself carries nothing but `AllSucceeded`.
 - `Execute` auto-sends `COMMIT` only when every statement in the batch
-  succeeded. On any failure it does **not** send `ROLLBACK` — it returns
-  per-statement results (which index, its SQL, the error) and leaves the
-  transaction open for the caller to explicitly resolve. This mirrors
-  tidb-multistmt's own library/caller split: that library never sends
-  `ROLLBACK` either; its caller does.
+  succeeded. On any failure it does **not** send `ROLLBACK` — each failing
+  statement's `Callback` already saw the error as it happened, and the
+  transaction is left open for the caller to explicitly resolve. This
+  mirrors tidb-multistmt's own library/caller split: that library never
+  sends `ROLLBACK` either; its caller does.
 - A connection/protocol-level failure (as opposed to one statement's SQL
   error) makes `Execute` return a non-nil `error` and leaves `conn` unusable
   — `Close` it and `Dial` a new one.
@@ -175,27 +177,14 @@ so most of the codebase keeps using `plain` (and its existing call sites
 don't change at all), while the specific code path that wants pipelined
 binary batches uses `binary.AcquireConn` instead.
 
-### Result sets
-
-`StatementResult.Result` (`*ResultSet`) is set for a successful row-returning
-statement: `Columns` (name/type/`Unsigned`/`Decimals`, decoded from the
-server's own column metadata) and `Rows` (`[][]any`, one value per column,
-`nil` for SQL `NULL`). Go value types per MySQL column type:
-
-| MySQL type family | Go type |
-|---|---|
-| `TINY`/`SHORT`/`LONG`/`LONGLONG`/`INT24`/`YEAR` | `int64`, or `uint64` if the column is `UNSIGNED` |
-| `FLOAT`/`DOUBLE` | `float64` |
-| `DATE`/`DATETIME`/`TIMESTAMP` | `time.Time` |
-| `TIME` | `time.Duration` (can be negative; MySQL `TIME` isn't bounded to 24h) |
-| `VARCHAR`/`TEXT`/`BLOB` family/`DECIMAL`/`JSON`/`ENUM`/`SET`/`BIT`/`GEOMETRY` | `[]byte` — this package doesn't know a column's charset well enough to decide when a `string` conversion is safe, so it leaves that (and its cost) to the caller |
-
 ### Callback: handle each statement where it's queued, streaming its rows
 
-`Add`'s fourth argument, if non-nil, is invoked exactly once by `Execute`,
+`Add`'s third argument, if non-nil, is invoked exactly once by `Execute`,
 synchronously, in queue order — right where that statement's response
-becomes available, instead of the caller walking `ExecuteResult.Results` by
-index afterward:
+becomes available. This is the *only* way to see a statement's error or
+result: `Execute` keeps no per-statement record after the batch finishes
+(`ExecuteResult` carries nothing but `AllSucceeded`), so there's exactly one
+place to look, not two.
 
 ```go
 b := binarymultistmt.NewBatch()
@@ -214,20 +203,36 @@ b.Add("SELECT id, balance FROM accounts WHERE balance > ?", []any{1000}, func(sr
 res, err := conn.Execute(ctx, b)
 ```
 
-For a row-returning statement, `sr.Rows` is a `*RowIterator` that reads and
-decodes rows directly off the wire as the callback calls `Next()` —
-`Execute` never buffers the whole result set into memory in this case (contrast
-with `StatementResult.Result`, which is only populated when there's no
-Callback). This also means the callback can stop early (`break` after the
-first matching row, for example): whatever it leaves unread is drained
-automatically once it returns, so later statements in the same batch stay
-correctly aligned on the wire — the callback is never required to consume to
-EOF itself, unlike tidb-multistmt's `Callback`/`Rows` contract.
+For a row-returning statement (`sr.HasResultSet`), `sr.Rows` is a
+`*RowIterator` that reads and decodes rows directly off the wire as the
+callback calls `Next()` — `Execute` never buffers a result set into memory.
+A statement queued with a `nil` Callback still has its rows drained (to keep
+the pipelined stream in sync for later statements), they are just never
+decoded or exposed anywhere — so a row-returning statement whose result you
+care about needs a Callback.
+
+The callback can also stop early (`break` after the first matching row, for
+example): whatever it leaves unread is drained automatically once it
+returns, so later statements in the same batch stay correctly aligned on the
+wire — the callback is never required to consume to EOF itself, unlike
+tidb-multistmt's `Callback`/`Rows` contract.
 
 A statement that fails before ever producing a result-set header (an ERR
 packet in place of one) still gets its callback invoked exactly once, with
 `sr.Rows == nil` and `sr.Err` set — `Execute`'s own bookkeeping guarantees
 "exactly once" regardless of which path a statement's response took.
+
+`Next()` decodes one row per column in `sr.Rows.Columns()` (name/type/
+`Unsigned`/`Decimals`, decoded from the server's own column metadata), `nil`
+for SQL `NULL`. Go value types per MySQL column type:
+
+| MySQL type family | Go type |
+|---|---|
+| `TINY`/`SHORT`/`LONG`/`LONGLONG`/`INT24`/`YEAR` | `int64`, or `uint64` if the column is `UNSIGNED` |
+| `FLOAT`/`DOUBLE` | `float64` |
+| `DATE`/`DATETIME`/`TIMESTAMP` | `time.Time` |
+| `TIME` | `time.Duration` (can be negative; MySQL `TIME` isn't bounded to 24h) |
+| `VARCHAR`/`TEXT`/`BLOB` family/`DECIMAL`/`JSON`/`ENUM`/`SET`/`BIT`/`GEOMETRY` | `[]byte` — this package doesn't know a column's charset well enough to decide when a `string` conversion is safe, so it leaves that (and its cost) to the caller |
 
 ### `WHERE id IN (?)` / bulk `INSERT`
 
@@ -262,7 +267,7 @@ not just that this package's own encode/decode is self-consistent),
 `ExpandIn`/`ExpandValues` compose correctly with the pipelined-binary
 execution path end to end, and a `SELECT` covering every supported column
 type (including an unsigned max value and a microsecond-precision
-`DATETIME`) decodes correctly through this package's own `ResultSet` —
+`DATETIME`) decodes correctly through this package's own `RowIterator` —
 column metadata and row bytes TiDB actually sends, not hand-crafted
 fixtures.
 

@@ -63,7 +63,7 @@ func TestDrainExecuteResponse_EmptyPacketIsAnErrorNotAPanic(t *testing.T) {
 	client, server := pipePair(t)
 	go writeRawPacket(server, 0, nil)
 
-	_, err := drainExecuteResponse(client, false, nil)
+	err := drainExecuteResponse(client, false, nil)
 	if err == nil {
 		t.Fatalf("expected an error for an empty response packet, got nil")
 	}
@@ -80,7 +80,7 @@ func TestDrainExecuteResponse_EmptyRowPacketIsAnErrorNotAPanic(t *testing.T) {
 		writeRawPacket(server, 3, nil)
 	}()
 
-	_, err := drainExecuteResponse(client, true, nil)
+	err := drainExecuteResponse(client, true, nil)
 	if err == nil {
 		t.Fatalf("expected an error for an empty row packet, got nil")
 	}

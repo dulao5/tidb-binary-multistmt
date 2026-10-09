@@ -3,9 +3,59 @@
 # tidb-binary-multistmt
 
 API reference for [github.com/dulao5/tidb-binary-multistmt](https://github.com/dulao5/tidb-binary-multistmt),
-generated from the package's own Go doc comments. For the runnable usage
-examples this page cross-references, see the
-[repository README](https://github.com/dulao5/tidb-binary-multistmt#readme).
+generated from the package's own Go doc comments. For the repository and
+issue tracker, see [the GitHub repo](https://github.com/dulao5/tidb-binary-multistmt).
+
+## Quick example
+
+```go
+conn, err := binarymultistmt.Dial(ctx, "user:pass@tcp(host:4000)/db")
+if err != nil { ... }
+defer conn.Close()
+
+var failed []string
+b := binarymultistmt.NewBatch()
+b.Add("INSERT INTO accounts (id, balance) VALUES (?, ?)", []any{1, 100}, func(sr *binarymultistmt.StatementResult) {
+    if sr.Err != nil {
+        failed = append(failed, fmt.Sprintf("#%d (%s): %v", sr.Index, sr.SQL, sr.Err))
+    }
+})
+b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, func(sr *binarymultistmt.StatementResult) {
+    if sr.Err != nil {
+        failed = append(failed, fmt.Sprintf("#%d (%s): %v", sr.Index, sr.SQL, sr.Err))
+        return
+    }
+    for row := sr.Rows.Next(); row != nil; row = sr.Rows.Next() {
+        fmt.Println("balance:", row[0])
+    }
+})
+
+res, err := conn.Execute(ctx, b)
+if err != nil {
+    // connection/protocol-level failure — conn is no longer usable, Close it
+    conn.Close()
+    return err
+}
+if !res.AllSucceeded {
+    for _, f := range failed {
+        log.Println("failed:", f)
+    }
+    // Execute did NOT send ROLLBACK — the transaction is still open on conn.
+    // Decide what to do (roll back, inspect further, retry) and act
+    // explicitly:
+    if err := conn.Rollback(ctx); err != nil { ... }
+    return
+}
+// every statement succeeded — Execute already sent COMMIT.
+```
+
+Each statement's error and result arrive through its own `Callback`
+(`sr.Err`, and for a row-returning statement `sr.Rows`, a `*RowIterator`
+streaming rows directly off the wire) — `Execute` keeps no per-statement
+record afterward, so this is the only place to look. See
+[Usage](#usage-one-shot-dial-or-a-pooled-dbacquireconn) below and the
+[repository README](https://github.com/dulao5/tidb-binary-multistmt#readme)
+for more worked examples (connection pooling, `IN (?)`/bulk `INSERT`).
 
 ## Concept
 
@@ -51,16 +101,16 @@ decision to it. `*binarymultistmt.DB` is a separate, independently-dialed
 pool, not a view onto an existing `*sql.DB` — it doesn't embed one and isn't
 assignable to a `*sql.DB`-typed parameter/field.
 
-Both paths share the same contract: `HasResultSet` (the third `Batch.Add`
-argument) must be `true` iff the statement is row-returning — get it wrong
-and every later statement in the batch desyncs. `Execute` auto-sends
+Both paths share the same contract: whether a statement is row-returning is
+detected automatically from the server's own `COM_STMT_PREPARE` response, so
+the caller never declares it and can't get it wrong. `Execute` auto-sends
 `COMMIT` only when every statement succeeded; on any failure it does **not**
-send `ROLLBACK` — it returns per-statement results (index, SQL, error) and
-leaves the transaction open for the caller to explicitly resolve. A
-connection/protocol-level failure (as opposed to one statement's SQL error)
-makes `Execute` return a non-nil `error` and leaves the connection unusable —
-`Close` it (or let a pooled `Conn`'s own `Close` discard it automatically)
-rather than reusing it.
+send `ROLLBACK` — each failing statement's `Callback` already saw the error
+as it happened, and the transaction is left open for the caller to
+explicitly resolve. A connection/protocol-level failure (as opposed to one
+statement's SQL error) makes `Execute` return a non-nil `error` and leaves
+the connection unusable — `Close` it (or let a pooled `Conn`'s own `Close`
+discard it automatically) rather than reusing it.
 
 See the README's
 [Usage](https://github.com/dulao5/tidb-binary-multistmt#usage) and
@@ -118,7 +168,7 @@ See the package README for status, known limitations \(most notably: TLS is not 
 - [func ExpandValues\(sqlText string, rows \[\]\[\]any\) \(string, \[\]any, error\)](<#ExpandValues>)
 - [type Batch](<#Batch>)
   - [func NewBatch\(\) \*Batch](<#NewBatch>)
-  - [func \(b \*Batch\) Add\(sqlText string, args \[\]any, hasResultSet bool\) \*Batch](<#Batch.Add>)
+  - [func \(b \*Batch\) Add\(sqlText string, args \[\]any, cb func\(\*StatementResult\)\) \*Batch](<#Batch.Add>)
   - [func \(b \*Batch\) Len\(\) int](<#Batch.Len>)
   - [func \(b \*Batch\) Statements\(\) \[\]Statement](<#Batch.Statements>)
 - [type Column](<#Column>)
@@ -132,7 +182,10 @@ See the package README for status, known limitations \(most notably: TLS is not 
   - [func \(db \*DB\) AcquireConn\(ctx context.Context\) \(\*Conn, error\)](<#DB.AcquireConn>)
   - [func \(db \*DB\) Close\(\) error](<#DB.Close>)
 - [type ExecuteResult](<#ExecuteResult>)
-- [type ResultSet](<#ResultSet>)
+- [type RowIterator](<#RowIterator>)
+  - [func \(it \*RowIterator\) Columns\(\) \[\]Column](<#RowIterator.Columns>)
+  - [func \(it \*RowIterator\) Err\(\) error](<#RowIterator.Err>)
+  - [func \(it \*RowIterator\) Next\(\) \[\]any](<#RowIterator.Next>)
 - [type SQLError](<#SQLError>)
   - [func \(e \*SQLError\) Error\(\) string](<#SQLError.Error>)
 - [type Statement](<#Statement>)
@@ -178,7 +231,7 @@ sqlText must contain exactly one parenthesized group whose content, trimmed of w
 Every element of every row is still bound exactly the way a scalar Statement.Args element always is — one value per flattened "?", sent as a genuine COM\_STMT\_EXECUTE binary protocol parameter \(see buildExecutePayload\), not formatted into the SQL text at all. ExpandValues only rewrites placeholder text and reorders/flattens the Go values; it never itself produces a SQL literal, so \(unlike tidb\-multistmt's text\-protocol SET\-literal mechanism\) there is no string\-escaping behavior here to get wrong in the first place — no NO\_BACKSLASH\_ESCAPES/legacy\- charset injection surface to worry about.
 
 <a name="Batch"></a>
-## type [Batch](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L20-L22>)
+## type [Batch](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L31-L33>)
 
 Batch is an ordered queue of Statements to pipeline in one Conn.Execute call. The zero value is not usable; create one with NewBatch.
 
@@ -189,7 +242,7 @@ type Batch struct {
 ```
 
 <a name="NewBatch"></a>
-### func [NewBatch](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L25>)
+### func [NewBatch](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L36>)
 
 ```go
 func NewBatch() *Batch
@@ -198,16 +251,16 @@ func NewBatch() *Batch
 NewBatch creates an empty Batch.
 
 <a name="Batch.Add"></a>
-### func \(\*Batch\) [Add](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L31>)
+### func \(\*Batch\) [Add](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L46>)
 
 ```go
-func (b *Batch) Add(sqlText string, args []any, hasResultSet bool) *Batch
+func (b *Batch) Add(sqlText string, args []any, cb func(*StatementResult)) *Batch
 ```
 
-Add queues sqlText \(with its Args\) for execution, returning the Batch for chaining. hasResultSet is as documented on Statement.
+Add queues sqlText \(with its Args\) for execution, returning the Batch for chaining. Whether sqlText is row\-returning is determined automatically from the server's own COM\_STMT\_PREPARE response — the caller no longer declares it. cb is as documented on Statement.Callback; pass nil if you don't need this statement's error or result \(e.g. it's a non\-row\-returning statement and ExecuteResult.AllSucceeded is enough\).
 
 <a name="Batch.Len"></a>
-### func \(\*Batch\) [Len](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L37>)
+### func \(\*Batch\) [Len](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L52>)
 
 ```go
 func (b *Batch) Len() int
@@ -216,7 +269,7 @@ func (b *Batch) Len() int
 Len returns the number of queued statements.
 
 <a name="Batch.Statements"></a>
-### func \(\*Batch\) [Statements](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L40>)
+### func \(\*Batch\) [Statements](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L55>)
 
 ```go
 func (b *Batch) Statements() []Statement
@@ -250,7 +303,7 @@ type Conn struct {
 ```
 
 <a name="Dial"></a>
-### func [Dial](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L70>)
+### func [Dial](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L73>)
 
 ```go
 func Dial(ctx context.Context, dsn string) (*Conn, error)
@@ -259,7 +312,7 @@ func Dial(ctx context.Context, dsn string) (*Conn, error)
 Dial opens dsn \(a standard go\-sql\-driver/mysql DSN\) via the driver's normal handshake/auth, then hijacks the underlying net.Conn for direct binary\-protocol use. The returned Conn owns that connection for its lifetime; call Close when done.
 
 <a name="Conn.Close"></a>
-### func \(\*Conn\) [Close](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L138>)
+### func \(\*Conn\) [Close](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L141>)
 
 ```go
 func (c *Conn) Close() error
@@ -268,7 +321,7 @@ func (c *Conn) Close() error
 Close releases c. For a Dial\-sourced Conn this destroys the connection and its dedicated factory \*sql.DB. For an AcquireConn\-sourced Conn, it instead returns c to its DB's own idle pool for reuse by a later AcquireConn call — unless c suffered a connection/protocol\-level failure \(see Execute/Rollback's doc comments\), in which case it is destroyed instead. Either way, c must not be used after Close.
 
 <a name="Conn.Execute"></a>
-### func \(\*Conn\) [Execute](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L349>)
+### func \(\*Conn\) [Execute](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L412>)
 
 ```go
 func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error)
@@ -279,7 +332,7 @@ Execute sends BEGIN, writes every statement in b's EXECUTE packet back\-to\-back
 A connection/protocol\-level failure \(as opposed to a per\-statement SQL\-level ERR\) returns a non\-nil error and leaves c unusable — the caller must Close it and Dial a new one.
 
 <a name="Conn.Rollback"></a>
-### func \(\*Conn\) [Rollback](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L424>)
+### func \(\*Conn\) [Rollback](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L509>)
 
 ```go
 func (c *Conn) Rollback(ctx context.Context) error
@@ -326,13 +379,12 @@ func (db *DB) Close() error
 Close destroys every currently idle connection and closes the underlying dial/auth factory. A Conn already checked out via AcquireConn at the time of Close is unaffected until its own Close is called, at which point release notices db is closed and destroys it instead of re\-idling it.
 
 <a name="ExecuteResult"></a>
-## type [ExecuteResult](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L38-L46>)
+## type [ExecuteResult](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L105-L112>)
 
 ExecuteResult is what Conn.Execute returns.
 
 ```go
 type ExecuteResult struct {
-    Results []StatementResult
     // AllSucceeded reports whether every statement in the batch succeeded.
     // When true, Execute has already sent COMMIT. When false, Execute has
     // NOT sent ROLLBACK — the transaction is left open on this Conn for the
@@ -342,17 +394,43 @@ type ExecuteResult struct {
 }
 ```
 
-<a name="ResultSet"></a>
-## type [ResultSet](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/resultset.go#L57-L60>)
+<a name="RowIterator"></a>
+## type [RowIterator](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L52-L58>)
 
-ResultSet is a SELECT \(or other row\-returning statement\)'s decoded output: Columns in order, and Rows in order, each row one value per column \(nil for SQL NULL\).
+RowIterator streams one row\-returning statement's rows directly off the wire, one at a time, instead of Conn.Execute buffering the whole result set up front. Only valid for the duration of the Callback call that receives it via StatementResult.Rows.
 
 ```go
-type ResultSet struct {
-    Columns []Column
-    Rows    [][]any
+type RowIterator struct {
+    // contains filtered or unexported fields
 }
 ```
+
+<a name="RowIterator.Columns"></a>
+### func \(\*RowIterator\) [Columns](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L61>)
+
+```go
+func (it *RowIterator) Columns() []Column
+```
+
+Columns returns this result set's column list.
+
+<a name="RowIterator.Err"></a>
+### func \(\*RowIterator\) [Err](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L102>)
+
+```go
+func (it *RowIterator) Err() error
+```
+
+Err reports the error that stopped iteration, or nil if Next returned nil because the result set was exhausted normally.
+
+<a name="RowIterator.Next"></a>
+### func \(\*RowIterator\) [Next](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L66>)
+
+```go
+func (it *RowIterator) Next() []any
+```
+
+Next decodes and returns the next row \(one value per Columns\(\), nil for SQL NULL\), or nil when there are no more rows — call Err afterward to tell a clean end\-of\-result\-set apart from a failure partway through.
 
 <a name="SQLError"></a>
 ## type [SQLError](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L18-L20>)
@@ -375,7 +453,7 @@ func (e *SQLError) Error() string
 
 
 <a name="Statement"></a>
-## type [Statement](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L4-L16>)
+## type [Statement](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/batch.go#L4-L27>)
 
 Statement is one queued unit of work in a Batch.
 
@@ -388,29 +466,48 @@ type Statement struct {
     // Args are bound, in order, to SQL's "?" placeholders.
     Args []any
 
-    // HasResultSet must be true iff SQL is row-returning (SELECT, SHOW,
-    // ...). Getting it wrong desyncs every later statement's response in
-    // the same batch, the same way it does in tidb-multistmt.
-    HasResultSet bool
+    // Callback, if non-nil, is invoked exactly once by Conn.Execute,
+    // synchronously, in queue order, as soon as this statement's response is
+    // available. This is the only way to see a statement's error or result
+    // — Conn.Execute keeps no per-statement record after the batch
+    // finishes, so a row-returning statement queued with a nil Callback has
+    // its rows silently discarded (still drained off the wire, just never
+    // decoded or exposed).
+    //
+    // For a row-returning statement, the StatementResult Callback receives
+    // has Rows set to a RowIterator that streams rows directly off the wire
+    // as the callback calls Next() — Execute never buffers the result set
+    // in this case. The callback must not retain Rows past its own return;
+    // any rows it doesn't consume are drained automatically once it
+    // returns, to keep the pipelined stream in sync for later statements.
+    Callback func(*StatementResult)
 }
 ```
 
 <a name="StatementResult"></a>
-## type [StatementResult](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L25-L35>)
+## type [StatementResult](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L28-L46>)
 
-StatementResult is one Batch statement's outcome after Conn.Execute.
+StatementResult is one Batch statement's outcome, delivered to its Callback — see Statement.Callback. There is no other way to read a statement's result: Conn.Execute keeps no per\-statement record after the batch finishes, on purpose, so there's exactly one place to look.
 
 ```go
 type StatementResult struct {
     Index int
     SQL   string
+    // HasResultSet reports whether this statement is row-returning, per the
+    // server's own COM_STMT_PREPARE response (see prepare()) — not a
+    // caller-supplied flag.
+    HasResultSet bool
     // Err is nil on success, or the error for this statement (typically a
     // *SQLError for a server-reported failure).
     Err error
-    // Result is the decoded result set for a row-returning statement that
-    // succeeded (nil for a non-row-returning statement, or one that
-    // failed).
-    Result *ResultSet
+    // Rows is non-nil only while Callback runs for a statement with
+    // HasResultSet true and Err nil: a forward-only iterator reading rows
+    // directly off the wire, so Execute never buffers a result set in
+    // memory. Do not retain or use it after Callback returns. A statement
+    // queued with a nil Callback still has its rows drained (to keep the
+    // pipelined stream in sync for later statements) — they are simply
+    // never decoded or exposed anywhere.
+    Rows *RowIterator
 }
 ```
 

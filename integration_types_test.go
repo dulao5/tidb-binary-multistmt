@@ -11,10 +11,9 @@ import (
 
 // TestIntegration_AllSupportedParamTypesRoundTrip inserts one row binding
 // every type buildExecutePayload supports, then reads it back through a
-// normal driver connection (this package doesn't decode result sets yet —
-// see the result-set-decoding issue) to confirm TiDB actually understood
-// the encoded values, not just that this package's own encode/decode is
-// internally self-consistent.
+// normal driver connection to confirm TiDB actually understood the encoded
+// values, not just that this package's own encode/decode is internally
+// self-consistent.
 func TestIntegration_AllSupportedParamTypesRoundTrip(t *testing.T) {
 	dsn := testDSN(t)
 	db, err := sql.Open("mysql", dsn)
@@ -73,7 +72,7 @@ func TestIntegration_AllSupportedParamTypesRoundTrip(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 	if !res.AllSucceeded {
-		t.Fatalf("expected success, got %+v", res.Results)
+		t.Fatalf("expected success")
 	}
 
 	var (
@@ -167,37 +166,40 @@ func TestIntegration_SelectDecodesAllSupportedTypes(t *testing.T) {
 		t.Fatalf("insert: err=%v res=%+v", err, res)
 	}
 
+	var cols []Column
+	var rows [][]any
 	sel := NewBatch()
-	sel.Add("SELECT b, i64, u64, f64, s, n_blob, t FROM tbms_select_decode WHERE id = ?", []any{int64(1)}, nil)
+	sel.Add("SELECT b, i64, u64, f64, s, n_blob, t FROM tbms_select_decode WHERE id = ?", []any{int64(1)}, func(sr *StatementResult) {
+		cols = sr.Rows.Columns()
+		for row := sr.Rows.Next(); row != nil; row = sr.Rows.Next() {
+			rows = append(rows, row)
+		}
+	})
 	res, err := conn.Execute(ctx, sel)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
 	if !res.AllSucceeded {
-		t.Fatalf("expected success, got %+v", res.Results)
+		t.Fatalf("expected success")
 	}
 
-	rs := res.Results[0].Result
-	if rs == nil {
-		t.Fatalf("expected a decoded ResultSet, got nil")
-	}
-	if len(rs.Rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(rs.Rows))
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
 	wantCols := []string{"b", "i64", "u64", "f64", "s", "n_blob", "t"}
-	if len(rs.Columns) != len(wantCols) {
-		t.Fatalf("expected %d columns, got %d", len(wantCols), len(rs.Columns))
+	if len(cols) != len(wantCols) {
+		t.Fatalf("expected %d columns, got %d", len(wantCols), len(cols))
 	}
 	for i, name := range wantCols {
-		if rs.Columns[i].Name != name {
-			t.Errorf("column %d: expected name %q, got %q", i, name, rs.Columns[i].Name)
+		if cols[i].Name != name {
+			t.Errorf("column %d: expected name %q, got %q", i, name, cols[i].Name)
 		}
 	}
-	if !rs.Columns[2].Unsigned {
+	if !cols[2].Unsigned {
 		t.Errorf("u64 column: expected Unsigned=true")
 	}
 
-	row := rs.Rows[0]
+	row := rows[0]
 	if got, ok := row[0].(int64); !ok || got != 1 { // BOOL/TINYINT comes back as int64
 		t.Errorf("b: got %#v, want int64(1)", row[0])
 	}

@@ -11,9 +11,11 @@ type Statement struct {
 
 	// Callback, if non-nil, is invoked exactly once by Conn.Execute,
 	// synchronously, in queue order, as soon as this statement's response is
-	// available — the caller gets this statement's error/result right where
-	// it was queued instead of re-walking ExecuteResult.Results by index
-	// afterward.
+	// available. This is the only way to see a statement's error or result
+	// — Conn.Execute keeps no per-statement record after the batch
+	// finishes, so a row-returning statement queued with a nil Callback has
+	// its rows silently discarded (still drained off the wire, just never
+	// decoded or exposed).
 	//
 	// For a row-returning statement, the StatementResult Callback receives
 	// has Rows set to a RowIterator that streams rows directly off the wire
@@ -39,7 +41,8 @@ func NewBatch() *Batch {
 // chaining. Whether sqlText is row-returning is determined automatically
 // from the server's own COM_STMT_PREPARE response — the caller no longer
 // declares it. cb is as documented on Statement.Callback; pass nil if you
-// only want the final ExecuteResult.
+// don't need this statement's error or result (e.g. it's a non-row-returning
+// statement and ExecuteResult.AllSucceeded is enough).
 func (b *Batch) Add(sqlText string, args []any, cb func(*StatementResult)) *Batch {
 	b.stmts = append(b.stmts, Statement{SQL: sqlText, Args: args, Callback: cb})
 	return b

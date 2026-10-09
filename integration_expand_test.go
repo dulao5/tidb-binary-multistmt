@@ -11,10 +11,7 @@ import (
 // TestIntegration_ExpandInSelectsMultipleRows confirms ExpandIn's expanded
 // SQL/args actually work end to end: a variable-length IN-list, PREPAREd
 // and pipelined-EXECUTEd against real TiDB, selects exactly the rows it
-// should. This package doesn't decode result sets yet (see the
-// result-set-decoding issue), so this only confirms the statement doesn't
-// fail — the row *count* reaching the caller is checked via the OK-path of
-// a companion non-SELECT statement in the same batch instead.
+// should.
 func TestIntegration_ExpandInSelectsMultipleRows(t *testing.T) {
 	dsn := testDSN(t)
 	setupTable(t, dsn, "tbms_expandin")
@@ -42,14 +39,22 @@ func TestIntegration_ExpandInSelectsMultipleRows(t *testing.T) {
 	}
 	defer conn.Close()
 
+	var gotRows int
 	b := NewBatch()
-	b.Add(sql_, args, nil)
+	b.Add(sql_, args, func(sr *StatementResult) {
+		for row := sr.Rows.Next(); row != nil; row = sr.Rows.Next() {
+			gotRows++
+		}
+	})
 	res, err := conn.Execute(ctx, b)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
 	if !res.AllSucceeded {
-		t.Fatalf("expected the expanded IN-list SELECT to succeed, got %+v", res.Results)
+		t.Fatalf("expected the expanded IN-list SELECT to succeed")
+	}
+	if gotRows != 3 {
+		t.Fatalf("expected 3 rows (ids 1,3,5), got %d", gotRows)
 	}
 }
 
@@ -83,7 +88,7 @@ func TestIntegration_ExpandValuesBulkInsert(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 	if !res.AllSucceeded {
-		t.Fatalf("expected the expanded bulk INSERT to succeed, got %+v", res.Results)
+		t.Fatalf("expected the expanded bulk INSERT to succeed")
 	}
 
 	if got, want := rowCount(t, dsn, "tbms_expandvalues"), 3; got != want {

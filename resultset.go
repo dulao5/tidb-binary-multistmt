@@ -51,14 +51,6 @@ type Column struct {
 	Decimals byte
 }
 
-// ResultSet is a SELECT (or other row-returning statement)'s decoded
-// output: Columns in order, and Rows in order, each row one value per
-// column (nil for SQL NULL).
-type ResultSet struct {
-	Columns []Column
-	Rows    [][]any
-}
-
 // byteCursor is a small forward-only reader over an in-memory packet
 // payload, for the length-encoded-string/fixed-width-field parsing
 // column-definition and binary-row decoding both need. Every method

@@ -1,9 +1,59 @@
 # tidb-binary-multistmt
 
 API reference for [github.com/dulao5/tidb-binary-multistmt](https://github.com/dulao5/tidb-binary-multistmt),
-generated from the package's own Go doc comments. For the runnable usage
-examples this page cross-references, see the
-[repository README](https://github.com/dulao5/tidb-binary-multistmt#readme).
+generated from the package's own Go doc comments. For the repository and
+issue tracker, see [the GitHub repo](https://github.com/dulao5/tidb-binary-multistmt).
+
+## Quick example
+
+```go
+conn, err := binarymultistmt.Dial(ctx, "user:pass@tcp(host:4000)/db")
+if err != nil { ... }
+defer conn.Close()
+
+var failed []string
+b := binarymultistmt.NewBatch()
+b.Add("INSERT INTO accounts (id, balance) VALUES (?, ?)", []any{1, 100}, func(sr *binarymultistmt.StatementResult) {
+    if sr.Err != nil {
+        failed = append(failed, fmt.Sprintf("#%d (%s): %v", sr.Index, sr.SQL, sr.Err))
+    }
+})
+b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, func(sr *binarymultistmt.StatementResult) {
+    if sr.Err != nil {
+        failed = append(failed, fmt.Sprintf("#%d (%s): %v", sr.Index, sr.SQL, sr.Err))
+        return
+    }
+    for row := sr.Rows.Next(); row != nil; row = sr.Rows.Next() {
+        fmt.Println("balance:", row[0])
+    }
+})
+
+res, err := conn.Execute(ctx, b)
+if err != nil {
+    // connection/protocol-level failure — conn is no longer usable, Close it
+    conn.Close()
+    return err
+}
+if !res.AllSucceeded {
+    for _, f := range failed {
+        log.Println("failed:", f)
+    }
+    // Execute did NOT send ROLLBACK — the transaction is still open on conn.
+    // Decide what to do (roll back, inspect further, retry) and act
+    // explicitly:
+    if err := conn.Rollback(ctx); err != nil { ... }
+    return
+}
+// every statement succeeded — Execute already sent COMMIT.
+```
+
+Each statement's error and result arrive through its own `Callback`
+(`sr.Err`, and for a row-returning statement `sr.Rows`, a `*RowIterator`
+streaming rows directly off the wire) — `Execute` keeps no per-statement
+record afterward, so this is the only place to look. See
+[Usage](#usage-one-shot-dial-or-a-pooled-dbacquireconn) below and the
+[repository README](https://github.com/dulao5/tidb-binary-multistmt#readme)
+for more worked examples (connection pooling, `IN (?)`/bulk `INSERT`).
 
 ## Concept
 
@@ -49,16 +99,16 @@ decision to it. `*binarymultistmt.DB` is a separate, independently-dialed
 pool, not a view onto an existing `*sql.DB` — it doesn't embed one and isn't
 assignable to a `*sql.DB`-typed parameter/field.
 
-Both paths share the same contract: `HasResultSet` (the third `Batch.Add`
-argument) must be `true` iff the statement is row-returning — get it wrong
-and every later statement in the batch desyncs. `Execute` auto-sends
+Both paths share the same contract: whether a statement is row-returning is
+detected automatically from the server's own `COM_STMT_PREPARE` response, so
+the caller never declares it and can't get it wrong. `Execute` auto-sends
 `COMMIT` only when every statement succeeded; on any failure it does **not**
-send `ROLLBACK` — it returns per-statement results (index, SQL, error) and
-leaves the transaction open for the caller to explicitly resolve. A
-connection/protocol-level failure (as opposed to one statement's SQL error)
-makes `Execute` return a non-nil `error` and leaves the connection unusable —
-`Close` it (or let a pooled `Conn`'s own `Close` discard it automatically)
-rather than reusing it.
+send `ROLLBACK` — each failing statement's `Callback` already saw the error
+as it happened, and the transaction is left open for the caller to
+explicitly resolve. A connection/protocol-level failure (as opposed to one
+statement's SQL error) makes `Execute` return a non-nil `error` and leaves
+the connection unusable — `Close` it (or let a pooled `Conn`'s own `Close`
+discard it automatically) rather than reusing it.
 
 See the README's
 [Usage](https://github.com/dulao5/tidb-binary-multistmt#usage) and

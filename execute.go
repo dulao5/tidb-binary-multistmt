@@ -21,7 +21,10 @@ type SQLError struct {
 
 func (e *SQLError) Error() string { return e.msg }
 
-// StatementResult is one Batch statement's outcome after Conn.Execute.
+// StatementResult is one Batch statement's outcome, delivered to its
+// Callback — see Statement.Callback. There is no other way to read a
+// statement's result: Conn.Execute keeps no per-statement record after the
+// batch finishes, on purpose, so there's exactly one place to look.
 type StatementResult struct {
 	Index int
 	SQL   string
@@ -32,16 +35,13 @@ type StatementResult struct {
 	// Err is nil on success, or the error for this statement (typically a
 	// *SQLError for a server-reported failure).
 	Err error
-	// Result is the decoded result set for a row-returning statement that
-	// succeeded, when the statement had no Callback (nil for a
-	// non-row-returning statement, one that failed, or one whose Callback
-	// streamed it via Rows instead — see Statement.Callback).
-	Result *ResultSet
-	// Rows is non-nil only for the duration of a Callback call for a
-	// row-returning statement: a forward-only iterator reading rows
-	// directly off the wire, so Execute never buffers the whole result set
-	// when a Callback is set. Do not retain or use it after the Callback
-	// returns.
+	// Rows is non-nil only while Callback runs for a statement with
+	// HasResultSet true and Err nil: a forward-only iterator reading rows
+	// directly off the wire, so Execute never buffers a result set in
+	// memory. Do not retain or use it after Callback returns. A statement
+	// queued with a nil Callback still has its rows drained (to keep the
+	// pipelined stream in sync for later statements) — they are simply
+	// never decoded or exposed anywhere.
 	Rows *RowIterator
 }
 
@@ -103,7 +103,6 @@ func (it *RowIterator) Err() error { return it.err }
 
 // ExecuteResult is what Conn.Execute returns.
 type ExecuteResult struct {
-	Results []StatementResult
 	// AllSucceeded reports whether every statement in the batch succeeded.
 	// When true, Execute has already sent COMMIT. When false, Execute has
 	// NOT sent ROLLBACK — the transaction is left open on this Conn for the
@@ -319,31 +318,30 @@ func buildExecutePayload(stmtID uint32, args []any) ([]byte, error) {
 // that returns rows) the column-count/column-defs/EOF header followed by
 // its rows.
 //
-// When cb is nil, the full result set is decoded and buffered into the
-// returned *ResultSet. When cb is non-nil (only meaningful when
-// hasResultSet is true), rows are never buffered here: cb is invoked
-// exactly once, synchronously, with a RowIterator that reads directly off
-// raw as the caller calls Next() — the returned *ResultSet is then always
-// nil. Either way, any rows cb (or the caller) didn't consume are drained
-// automatically before this function returns, so raw is correctly
-// positioned at the next statement's response regardless of how much of
-// the result set was actually read.
-func drainExecuteResponse(raw io.Reader, hasResultSet bool, cb func(*RowIterator)) (*ResultSet, error) {
+// Rows are never buffered here. For a row-returning statement, cb (if
+// non-nil) is invoked exactly once, synchronously, with a RowIterator that
+// reads directly off raw as the caller calls Next(); if cb is nil, the rows
+// are simply never decoded into anything a caller can see. Either way, any
+// rows cb (or the caller) didn't consume are drained automatically before
+// this function returns, so raw is correctly positioned at the next
+// statement's response regardless of how much of the result set was
+// actually read.
+func drainExecuteResponse(raw io.Reader, hasResultSet bool, cb func(*RowIterator)) error {
 	resp, err := readPacket(raw)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if len(resp) == 0 {
-		return nil, fmt.Errorf("empty response packet")
+		return fmt.Errorf("empty response packet")
 	}
 	if resp[0] == 0xFF {
-		return nil, &SQLError{msg: errPacketText(resp)}
+		return &SQLError{msg: errPacketText(resp)}
 	}
 	if !hasResultSet {
 		if resp[0] != 0x00 {
-			return nil, fmt.Errorf("expected OK, got first byte 0x%02x", resp[0])
+			return fmt.Errorf("expected OK, got first byte 0x%02x", resp[0])
 		}
-		return nil, nil
+		return nil
 	}
 
 	// columnCount comes straight off the wire — do not use it to pre-size
@@ -357,40 +355,27 @@ func drainExecuteResponse(raw io.Reader, hasResultSet bool, cb func(*RowIterator
 	for i := uint64(0); i < columnCount; i++ {
 		defPkt, err := readPacket(raw)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		col, err := decodeColumnDef(defPkt)
 		if err != nil {
-			return nil, fmt.Errorf("column %d: %w", i, err)
+			return fmt.Errorf("column %d: %w", i, err)
 		}
 		cols = append(cols, col)
 	}
 	if columnCount > 0 {
 		if _, err := readPacket(raw); err != nil { // EOF after column defs
-			return nil, err
+			return err
 		}
 	}
 
 	it := &RowIterator{cols: cols, raw: raw}
 	if cb != nil {
 		cb(it)
-		for it.Next() != nil { // drain whatever cb left unread
-		}
-		return nil, it.err
 	}
-
-	rs := &ResultSet{Columns: cols}
-	for {
-		row := it.Next()
-		if row == nil {
-			break
-		}
-		rs.Rows = append(rs.Rows, row)
+	for it.Next() != nil { // drain whatever cb (or no one) left unread
 	}
-	if it.err != nil {
-		return nil, it.err
-	}
-	return rs, nil
+	return it.err
 }
 
 func writeComQuery(w io.Writer, text string) error {
@@ -466,7 +451,6 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 		}
 	}
 
-	results := make([]StatementResult, len(stmts))
 	allOK := true
 	for i, s := range stmts {
 		hrs := hasResultSet[i]
@@ -487,10 +471,9 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 			}
 		}
 
-		rs, err := drainExecuteResponse(c.raw, hrs, cb)
-		sr := StatementResult{Index: i, SQL: s.SQL, HasResultSet: hrs, Err: err, Result: rs}
-		results[i] = sr
+		err := drainExecuteResponse(c.raw, hrs, cb)
 		if s.Callback != nil && !calledViaStream {
+			sr := StatementResult{Index: i, SQL: s.SQL, HasResultSet: hrs, Err: err}
 			s.Callback(&sr)
 		}
 		if err != nil {
@@ -518,7 +501,7 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 		}
 	}
 
-	return &ExecuteResult{Results: results, AllSucceeded: allOK}, nil
+	return &ExecuteResult{AllSucceeded: allOK}, nil
 }
 
 // Rollback sends ROLLBACK on c. Call this after Execute returns an
