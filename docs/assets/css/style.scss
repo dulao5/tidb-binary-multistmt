@@ -1,0 +1,42 @@
+---
+---
+
+@import "{{ site.theme }}";
+
+// jekyll-theme-minimal's default layout is a fixed-width two-column
+// sidebar (header: 270px float-left, section: 500px float-right, wrapper
+// capped at 860px total) — on a normal-width screen the content column
+// (and therefore every <pre> code block in it) is stuck at ~500px no
+// matter how wide the browser window is. Override it to a single stacked
+// column that fills the available width up to a generous max, so code
+// blocks stop looking artificially narrow.
+.wrapper {
+  width: auto;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 40px;
+  box-sizing: border-box;
+}
+
+header {
+  position: static;
+  float: none;
+  width: auto;
+  padding-right: 0;
+}
+
+section {
+  float: none;
+  width: auto;
+  padding-bottom: 50px;
+}
+
+footer {
+  position: static;
+  float: none;
+  width: auto;
+}
+
+pre {
+  max-width: 100%;
+}
