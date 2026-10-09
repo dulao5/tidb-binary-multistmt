@@ -59,8 +59,8 @@ if err != nil { ... }
 defer conn.Close()
 
 b := binarymultistmt.NewBatch()
-b.Add("INSERT INTO accounts (id, balance) VALUES (?, ?)", []any{1, 100}, false)
-b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, true)
+b.Add("INSERT INTO accounts (id, balance) VALUES (?, ?)", []any{1, 100}, nil)
+b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, nil)
 
 res, err := conn.Execute(ctx, b)
 if err != nil {
@@ -96,9 +96,10 @@ for _, r := range res.Results {
 }
 ```
 
-- `HasResultSet` (the third `Add` argument) must be `true` iff the statement
-  is row-returning, same convention as tidb-multistmt — get it wrong and
-  every later statement in the batch desyncs.
+- Whether a statement is row-returning is detected automatically, from the
+  server's own `COM_STMT_PREPARE` response (its column-count field is `0`
+  for a non-row-returning statement) — unlike tidb-multistmt, the caller
+  never declares this and so can't get it wrong.
 - `Execute` auto-sends `COMMIT` only when every statement in the batch
   succeeded. On any failure it does **not** send `ROLLBACK` — it returns
   per-statement results (which index, its SQL, the error) and leaves the
@@ -189,6 +190,45 @@ server's own column metadata) and `Rows` (`[][]any`, one value per column,
 | `TIME` | `time.Duration` (can be negative; MySQL `TIME` isn't bounded to 24h) |
 | `VARCHAR`/`TEXT`/`BLOB` family/`DECIMAL`/`JSON`/`ENUM`/`SET`/`BIT`/`GEOMETRY` | `[]byte` — this package doesn't know a column's charset well enough to decide when a `string` conversion is safe, so it leaves that (and its cost) to the caller |
 
+### Callback: handle each statement where it's queued, streaming its rows
+
+`Add`'s fourth argument, if non-nil, is invoked exactly once by `Execute`,
+synchronously, in queue order — right where that statement's response
+becomes available, instead of the caller walking `ExecuteResult.Results` by
+index afterward:
+
+```go
+b := binarymultistmt.NewBatch()
+b.Add("SELECT id, balance FROM accounts WHERE balance > ?", []any{1000}, func(sr *binarymultistmt.StatementResult) {
+    if sr.Err != nil {
+        log.Printf("query failed: %v", sr.Err)
+        return
+    }
+    for row := sr.Rows.Next(); row != nil; row = sr.Rows.Next() {
+        fmt.Println(row[0], row[1])
+    }
+    if err := sr.Rows.Err(); err != nil {
+        log.Printf("stream broke mid-result: %v", err)
+    }
+})
+res, err := conn.Execute(ctx, b)
+```
+
+For a row-returning statement, `sr.Rows` is a `*RowIterator` that reads and
+decodes rows directly off the wire as the callback calls `Next()` —
+`Execute` never buffers the whole result set into memory in this case (contrast
+with `StatementResult.Result`, which is only populated when there's no
+Callback). This also means the callback can stop early (`break` after the
+first matching row, for example): whatever it leaves unread is drained
+automatically once it returns, so later statements in the same batch stay
+correctly aligned on the wire — the callback is never required to consume to
+EOF itself, unlike tidb-multistmt's `Callback`/`Rows` contract.
+
+A statement that fails before ever producing a result-set header (an ERR
+packet in place of one) still gets its callback invoked exactly once, with
+`sr.Rows == nil` and `sr.Err` set — `Execute`'s own bookkeeping guarantees
+"exactly once" regardless of which path a statement's response took.
+
 ### `WHERE id IN (?)` / bulk `INSERT`
 
 Same two functions as tidb-multistmt, same calling convention — call before
@@ -196,10 +236,10 @@ Same two functions as tidb-multistmt, same calling convention — call before
 
 ```go
 sql, args, err := binarymultistmt.ExpandIn("SELECT c FROM t WHERE id IN (?)", []any{ids})
-b.Add(sql, args, true)
+b.Add(sql, args, nil)
 
 sql, args, err := binarymultistmt.ExpandValues("INSERT INTO t (id, c) VALUES (?, ?)", rows)
-b.Add(sql, args, false)
+b.Add(sql, args, nil)
 ```
 
 As with tidb-multistmt, a variable-length `IN` list changes the rendered SQL

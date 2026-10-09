@@ -67,7 +67,7 @@ func FuzzDrainExecuteResponse(f *testing.F) {
 	f.Add(byte(1), []byte{0x01, 0x00, 0x00, 0x00, 0x01})
 	f.Add(byte(1), []byte{})
 	f.Fuzz(func(t *testing.T, selector byte, data []byte) {
-		drainExecuteResponse(bytes.NewReader(data), selector%2 == 0)
+		drainExecuteResponse(bytes.NewReader(data), selector%2 == 0, nil)
 	})
 }
 

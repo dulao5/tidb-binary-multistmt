@@ -155,7 +155,7 @@ func TestExpandIn_ComposesWithBatchAdd(t *testing.T) {
 	}
 
 	b := NewBatch()
-	b.Add(sql, args, true)
+	b.Add(sql, args, nil)
 	stmts := b.Statements()
 	if len(stmts) != 1 {
 		t.Fatalf("expected 1 queued statement, got %d", len(stmts))

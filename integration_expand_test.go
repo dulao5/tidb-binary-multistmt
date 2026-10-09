@@ -43,7 +43,7 @@ func TestIntegration_ExpandInSelectsMultipleRows(t *testing.T) {
 	defer conn.Close()
 
 	b := NewBatch()
-	b.Add(sql_, args, true)
+	b.Add(sql_, args, nil)
 	res, err := conn.Execute(ctx, b)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
@@ -77,7 +77,7 @@ func TestIntegration_ExpandValuesBulkInsert(t *testing.T) {
 	}
 
 	b := NewBatch()
-	b.Add(sql_, args, false)
+	b.Add(sql_, args, nil)
 	res, err := conn.Execute(ctx, b)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)

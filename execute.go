@@ -25,14 +25,81 @@ func (e *SQLError) Error() string { return e.msg }
 type StatementResult struct {
 	Index int
 	SQL   string
+	// HasResultSet reports whether this statement is row-returning, per the
+	// server's own COM_STMT_PREPARE response (see prepare()) — not a
+	// caller-supplied flag.
+	HasResultSet bool
 	// Err is nil on success, or the error for this statement (typically a
 	// *SQLError for a server-reported failure).
 	Err error
 	// Result is the decoded result set for a row-returning statement that
-	// succeeded (nil for a non-row-returning statement, or one that
-	// failed).
+	// succeeded, when the statement had no Callback (nil for a
+	// non-row-returning statement, one that failed, or one whose Callback
+	// streamed it via Rows instead — see Statement.Callback).
 	Result *ResultSet
+	// Rows is non-nil only for the duration of a Callback call for a
+	// row-returning statement: a forward-only iterator reading rows
+	// directly off the wire, so Execute never buffers the whole result set
+	// when a Callback is set. Do not retain or use it after the Callback
+	// returns.
+	Rows *RowIterator
 }
+
+// RowIterator streams one row-returning statement's rows directly off the
+// wire, one at a time, instead of Conn.Execute buffering the whole result
+// set up front. Only valid for the duration of the Callback call that
+// receives it via StatementResult.Rows.
+type RowIterator struct {
+	cols  []Column
+	raw   io.Reader
+	err   error
+	done  bool
+	count int
+}
+
+// Columns returns this result set's column list.
+func (it *RowIterator) Columns() []Column { return it.cols }
+
+// Next decodes and returns the next row (one value per Columns(), nil for
+// SQL NULL), or nil when there are no more rows — call Err afterward to tell
+// a clean end-of-result-set apart from a failure partway through.
+func (it *RowIterator) Next() []any {
+	if it.done {
+		return nil
+	}
+	row, err := readPacket(it.raw)
+	if err != nil {
+		it.err = err
+		it.done = true
+		return nil
+	}
+	if len(row) == 0 {
+		it.err = fmt.Errorf("empty row packet")
+		it.done = true
+		return nil
+	}
+	if row[0] == 0xFF {
+		it.err = &SQLError{msg: errPacketText(row)}
+		it.done = true
+		return nil
+	}
+	if row[0] == 0xFE && len(row) < 9 {
+		it.done = true // terminal EOF, not an error
+		return nil
+	}
+	values, err := decodeBinaryRow(row, it.cols)
+	if err != nil {
+		it.err = fmt.Errorf("row %d: %w", it.count, err)
+		it.done = true
+		return nil
+	}
+	it.count++
+	return values
+}
+
+// Err reports the error that stopped iteration, or nil if Next returned nil
+// because the result set was exhausted normally.
+func (it *RowIterator) Err() error { return it.err }
 
 // ExecuteResult is what Conn.Execute returns.
 type ExecuteResult struct {
@@ -47,8 +114,11 @@ type ExecuteResult struct {
 
 // prepare sends COM_STMT_PREPARE for sqlText (unless already cached on this
 // connection) and drains the param-definition/column-definition/EOF packets
-// that follow the OK.
-func (c *Conn) prepare(sqlText string, hasResultSet bool) (preparedStmt, error) {
+// that follow the OK. Whether sqlText is row-returning is read straight off
+// the wire — the OK packet's own column-count field, authoritative per the
+// MySQL binary protocol (0 for a non-row-returning statement) — rather than
+// taken on faith from the caller.
+func (c *Conn) prepare(sqlText string) (preparedStmt, error) {
 	if ps, ok := c.stmtCache[sqlText]; ok {
 		return ps, nil
 	}
@@ -97,7 +167,7 @@ func (c *Conn) prepare(sqlText string, hasResultSet bool) (preparedStmt, error) 
 		}
 	}
 
-	ps := preparedStmt{id: id, paramCount: paramCount, hasResultSet: hasResultSet}
+	ps := preparedStmt{id: id, paramCount: paramCount, hasResultSet: columnCount > 0}
 	c.stmtCache[sqlText] = ps
 	return ps, nil
 }
@@ -245,11 +315,20 @@ func buildExecutePayload(stmtID uint32, args []any) ([]byte, error) {
 }
 
 // drainExecuteResponse reads exactly one EXECUTE's response off the wire —
-// a single OK/ERR packet for a non-row-returning statement, or a full
-// binary result set (column-count/column-defs/EOF, then rows until a
-// terminal EOF, each decoded via decodeColumnDef/decodeBinaryRow) for one
-// that returns rows.
-func drainExecuteResponse(raw io.Reader, hasResultSet bool) (*ResultSet, error) {
+// a single OK/ERR packet for a non-row-returning statement, or (for one
+// that returns rows) the column-count/column-defs/EOF header followed by
+// its rows.
+//
+// When cb is nil, the full result set is decoded and buffered into the
+// returned *ResultSet. When cb is non-nil (only meaningful when
+// hasResultSet is true), rows are never buffered here: cb is invoked
+// exactly once, synchronously, with a RowIterator that reads directly off
+// raw as the caller calls Next() — the returned *ResultSet is then always
+// nil. Either way, any rows cb (or the caller) didn't consume are drained
+// automatically before this function returns, so raw is correctly
+// positioned at the next statement's response regardless of how much of
+// the result set was actually read.
+func drainExecuteResponse(raw io.Reader, hasResultSet bool, cb func(*RowIterator)) (*ResultSet, error) {
 	resp, err := readPacket(raw)
 	if err != nil {
 		return nil, err
@@ -292,27 +371,26 @@ func drainExecuteResponse(raw io.Reader, hasResultSet bool) (*ResultSet, error) 
 		}
 	}
 
+	it := &RowIterator{cols: cols, raw: raw}
+	if cb != nil {
+		cb(it)
+		for it.Next() != nil { // drain whatever cb left unread
+		}
+		return nil, it.err
+	}
+
 	rs := &ResultSet{Columns: cols}
 	for {
-		row, err := readPacket(raw)
-		if err != nil {
-			return nil, err
+		row := it.Next()
+		if row == nil {
+			break
 		}
-		if len(row) == 0 {
-			return nil, fmt.Errorf("empty row packet")
-		}
-		if row[0] == 0xFF {
-			return nil, &SQLError{msg: errPacketText(row)}
-		}
-		if row[0] == 0xFE && len(row) < 9 {
-			return rs, nil // terminal EOF
-		}
-		values, err := decodeBinaryRow(row, cols)
-		if err != nil {
-			return nil, fmt.Errorf("row %d: %w", len(rs.Rows), err)
-		}
-		rs.Rows = append(rs.Rows, values)
+		rs.Rows = append(rs.Rows, row)
 	}
+	if it.err != nil {
+		return nil, it.err
+	}
+	return rs, nil
 }
 
 func writeComQuery(w io.Writer, text string) error {
@@ -353,13 +431,15 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 	}
 
 	ids := make([]uint32, len(stmts))
+	hasResultSet := make([]bool, len(stmts))
 	for i, s := range stmts {
-		ps, err := c.prepare(s.SQL, s.HasResultSet)
+		ps, err := c.prepare(s.SQL)
 		if err != nil {
 			c.broken = true
 			return nil, fmt.Errorf("prepare statement #%d (%s): %w", i, s.SQL, err)
 		}
 		ids[i] = ps.id
+		hasResultSet[i] = ps.hasResultSet
 	}
 
 	if err := writeComQuery(c.raw, "BEGIN"); err != nil {
@@ -389,8 +469,30 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 	results := make([]StatementResult, len(stmts))
 	allOK := true
 	for i, s := range stmts {
-		rs, err := drainExecuteResponse(c.raw, s.HasResultSet)
-		results[i] = StatementResult{Index: i, SQL: s.SQL, Err: err, Result: rs}
+		hrs := hasResultSet[i]
+
+		// calledViaStream tracks whether cb below actually ran (it may not:
+		// a statement that fails outright — e.g. an ERR packet instead of a
+		// result-set header — never reaches the streaming branch inside
+		// drainExecuteResponse). Only when it didn't run do we invoke
+		// s.Callback ourselves afterward, so it fires exactly once either
+		// way.
+		calledViaStream := false
+		var cb func(*RowIterator)
+		if s.Callback != nil && hrs {
+			cb = func(it *RowIterator) {
+				calledViaStream = true
+				sr := StatementResult{Index: i, SQL: s.SQL, HasResultSet: true, Rows: it}
+				s.Callback(&sr)
+			}
+		}
+
+		rs, err := drainExecuteResponse(c.raw, hrs, cb)
+		sr := StatementResult{Index: i, SQL: s.SQL, HasResultSet: hrs, Err: err, Result: rs}
+		results[i] = sr
+		if s.Callback != nil && !calledViaStream {
+			s.Callback(&sr)
+		}
 		if err != nil {
 			var sqlErr *SQLError
 			if !errors.As(err, &sqlErr) {

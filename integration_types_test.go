@@ -65,7 +65,7 @@ func TestIntegration_AllSupportedParamTypesRoundTrip(t *testing.T) {
 			[]byte(nil),
 			wantTime,
 		},
-		false,
+		nil,
 	)
 
 	res, err := conn.Execute(ctx, b)
@@ -119,7 +119,7 @@ func TestIntegration_AllSupportedParamTypesRoundTrip(t *testing.T) {
 
 // TestIntegration_SelectDecodesAllSupportedTypes inserts the same shape of
 // row as the round-trip test above, then reads it back through this
-// package's own Conn.Execute (HasResultSet: true) and decoder — no driver
+// package's own Conn.Execute (auto-detected as row-returning) and decoder — no driver
 // readback this time — confirming decodeColumnDef/decodeBinaryRow correctly
 // understand real column metadata and row bytes TiDB actually sends, not
 // just hand-crafted fixtures.
@@ -161,14 +161,14 @@ func TestIntegration_SelectDecodesAllSupportedTypes(t *testing.T) {
 	insert.Add(
 		"INSERT INTO tbms_select_decode (id, b, i64, u64, f64, s, n_blob, t) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 		[]any{int64(1), true, int64(-123456789), uint64(18446744073709551615), 3.5, "hello, world", []byte(nil), wantTime},
-		false,
+		nil,
 	)
 	if res, err := conn.Execute(ctx, insert); err != nil || !res.AllSucceeded {
 		t.Fatalf("insert: err=%v res=%+v", err, res)
 	}
 
 	sel := NewBatch()
-	sel.Add("SELECT b, i64, u64, f64, s, n_blob, t FROM tbms_select_decode WHERE id = ?", []any{int64(1)}, true)
+	sel.Add("SELECT b, i64, u64, f64, s, n_blob, t FROM tbms_select_decode WHERE id = ?", []any{int64(1)}, nil)
 	res, err := conn.Execute(ctx, sel)
 	if err != nil {
 		t.Fatalf("Execute: %v", err)

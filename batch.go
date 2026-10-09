@@ -9,10 +9,19 @@ type Statement struct {
 	// Args are bound, in order, to SQL's "?" placeholders.
 	Args []any
 
-	// HasResultSet must be true iff SQL is row-returning (SELECT, SHOW,
-	// ...). Getting it wrong desyncs every later statement's response in
-	// the same batch, the same way it does in tidb-multistmt.
-	HasResultSet bool
+	// Callback, if non-nil, is invoked exactly once by Conn.Execute,
+	// synchronously, in queue order, as soon as this statement's response is
+	// available — the caller gets this statement's error/result right where
+	// it was queued instead of re-walking ExecuteResult.Results by index
+	// afterward.
+	//
+	// For a row-returning statement, the StatementResult Callback receives
+	// has Rows set to a RowIterator that streams rows directly off the wire
+	// as the callback calls Next() — Execute never buffers the result set
+	// in this case. The callback must not retain Rows past its own return;
+	// any rows it doesn't consume are drained automatically once it
+	// returns, to keep the pipelined stream in sync for later statements.
+	Callback func(*StatementResult)
 }
 
 // Batch is an ordered queue of Statements to pipeline in one Conn.Execute
@@ -27,9 +36,12 @@ func NewBatch() *Batch {
 }
 
 // Add queues sqlText (with its Args) for execution, returning the Batch for
-// chaining. hasResultSet is as documented on Statement.
-func (b *Batch) Add(sqlText string, args []any, hasResultSet bool) *Batch {
-	b.stmts = append(b.stmts, Statement{SQL: sqlText, Args: args, HasResultSet: hasResultSet})
+// chaining. Whether sqlText is row-returning is determined automatically
+// from the server's own COM_STMT_PREPARE response — the caller no longer
+// declares it. cb is as documented on Statement.Callback; pass nil if you
+// only want the final ExecuteResult.
+func (b *Batch) Add(sqlText string, args []any, cb func(*StatementResult)) *Batch {
+	b.stmts = append(b.stmts, Statement{SQL: sqlText, Args: args, Callback: cb})
 	return b
 }
 

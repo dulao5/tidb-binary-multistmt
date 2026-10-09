@@ -58,8 +58,11 @@ type Conn struct {
 }
 
 type preparedStmt struct {
-	id           uint32
-	paramCount   int
+	id         uint32
+	paramCount int
+	// hasResultSet comes straight from COM_STMT_PREPARE's own column-count
+	// field (0 means no result set) — the server's ground truth, not a
+	// caller-supplied guess. See prepare().
 	hasResultSet bool
 }
 

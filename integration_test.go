@@ -67,7 +67,7 @@ func TestIntegration_PipelinedInsertsCommit(t *testing.T) {
 
 	b := NewBatch()
 	for i := 1; i <= 5; i++ {
-		b.Add("INSERT INTO tbms_insert_commit (id, val) VALUES (?, ?)", []any{int64(i), fmt.Sprintf("v%d", i)}, false)
+		b.Add("INSERT INTO tbms_insert_commit (id, val) VALUES (?, ?)", []any{int64(i), fmt.Sprintf("v%d", i)}, nil)
 	}
 
 	res, err := conn.Execute(ctx, b)
@@ -95,9 +95,9 @@ func TestIntegration_FailureLeavesTransactionOpenForCallerRollback(t *testing.T)
 	defer conn.Close()
 
 	b := NewBatch()
-	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, false)
-	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(1), "dup"}, false) // duplicate PK
-	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(2), "after-failure"}, false)
+	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, nil)
+	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(1), "dup"}, nil) // duplicate PK
+	b.Add("INSERT INTO tbms_insert_fail (id, val) VALUES (?, ?)", []any{int64(2), "after-failure"}, nil)
 
 	res, err := conn.Execute(ctx, b)
 	if err != nil {
@@ -137,16 +137,16 @@ func TestIntegration_SelectDoesNotDesyncLaterStatements(t *testing.T) {
 
 	seed := NewBatch()
 	for i := 1; i <= 3; i++ {
-		seed.Add("INSERT INTO tbms_select_sync (id, val) VALUES (?, ?)", []any{int64(i), fmt.Sprintf("v%d", i)}, false)
+		seed.Add("INSERT INTO tbms_select_sync (id, val) VALUES (?, ?)", []any{int64(i), fmt.Sprintf("v%d", i)}, nil)
 	}
 	if res, err := conn.Execute(ctx, seed); err != nil || !res.AllSucceeded {
 		t.Fatalf("seed insert failed: err=%v res=%+v", err, res)
 	}
 
 	b := NewBatch()
-	b.Add("SELECT val FROM tbms_select_sync WHERE id = ?", []any{int64(1)}, true)
-	b.Add("INSERT INTO tbms_select_sync (id, val) VALUES (?, ?)", []any{int64(4), "after-select"}, false)
-	b.Add("SELECT val FROM tbms_select_sync WHERE id BETWEEN ? AND ?", []any{int64(1), int64(4)}, true)
+	b.Add("SELECT val FROM tbms_select_sync WHERE id = ?", []any{int64(1)}, nil)
+	b.Add("INSERT INTO tbms_select_sync (id, val) VALUES (?, ?)", []any{int64(4), "after-select"}, nil)
+	b.Add("SELECT val FROM tbms_select_sync WHERE id BETWEEN ? AND ?", []any{int64(1), int64(4)}, nil)
 
 	res, err := conn.Execute(ctx, b)
 	if err != nil {
@@ -180,8 +180,8 @@ func TestIntegration_SyntaxErrorFailsOnlyThatStatement(t *testing.T) {
 	defer conn.Close()
 
 	bad := NewBatch()
-	bad.Add("INSERT INTO tbms_syntax_error (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, false)
-	bad.Add("THIS IS NOT VALID SQL (?, ?)", []any{int64(2), "bad"}, false)
+	bad.Add("INSERT INTO tbms_syntax_error (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, nil)
+	bad.Add("THIS IS NOT VALID SQL (?, ?)", []any{int64(2), "bad"}, nil)
 
 	if _, err := conn.Execute(ctx, bad); err == nil {
 		t.Fatalf("expected Execute to fail on the malformed statement")
@@ -190,7 +190,7 @@ func TestIntegration_SyntaxErrorFailsOnlyThatStatement(t *testing.T) {
 	// conn must still be usable: the failure happened during prepare, before
 	// BEGIN was ever sent, so there's no stray open transaction to clean up.
 	good := NewBatch()
-	good.Add("INSERT INTO tbms_syntax_error (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, false)
+	good.Add("INSERT INTO tbms_syntax_error (id, val) VALUES (?, ?)", []any{int64(1), "ok"}, nil)
 	res, err := conn.Execute(ctx, good)
 	if err != nil {
 		t.Fatalf("Execute after a prior syntax error: %v", err)

@@ -14,7 +14,7 @@ import (
 // bookkeeping.
 func connectionID(t *testing.T, ctx context.Context, c *Conn) uint64 {
 	t.Helper()
-	b := NewBatch().Add("SELECT CONNECTION_ID()", nil, true)
+	b := NewBatch().Add("SELECT CONNECTION_ID()", nil, nil)
 	res, err := c.Execute(ctx, b)
 	if err != nil {
 		t.Fatalf("Execute(SELECT CONNECTION_ID()): %v", err)
@@ -83,7 +83,7 @@ func TestIntegration_DBDiscardsBrokenConn(t *testing.T) {
 	// An invalid PREPARE marks c1 broken (per Execute's doc comment) without
 	// actually desyncing the real wire — a convenient stand-in for a real
 	// protocol-level failure, exercising the same discard path.
-	bad := NewBatch().Add("THIS IS NOT VALID SQL", nil, false)
+	bad := NewBatch().Add("THIS IS NOT VALID SQL", nil, nil)
 	if _, err := c1.Execute(ctx, bad); err == nil {
 		t.Fatalf("expected Execute with invalid SQL to fail")
 	}

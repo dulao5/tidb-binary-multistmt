@@ -63,7 +63,7 @@ func TestDrainExecuteResponse_EmptyPacketIsAnErrorNotAPanic(t *testing.T) {
 	client, server := pipePair(t)
 	go writeRawPacket(server, 0, nil)
 
-	_, err := drainExecuteResponse(client, false)
+	_, err := drainExecuteResponse(client, false, nil)
 	if err == nil {
 		t.Fatalf("expected an error for an empty response packet, got nil")
 	}
@@ -80,7 +80,7 @@ func TestDrainExecuteResponse_EmptyRowPacketIsAnErrorNotAPanic(t *testing.T) {
 		writeRawPacket(server, 3, nil)
 	}()
 
-	_, err := drainExecuteResponse(client, true)
+	_, err := drainExecuteResponse(client, true, nil)
 	if err == nil {
 		t.Fatalf("expected an error for an empty row packet, got nil")
 	}
@@ -94,7 +94,7 @@ func TestPrepare_EmptyResponseIsAnErrorNotAPanic(t *testing.T) {
 	}()
 
 	c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
-	if _, err := c.prepare("SELECT 1", false); err == nil {
+	if _, err := c.prepare("SELECT 1"); err == nil {
 		t.Fatalf("expected an error for an empty prepare response, got nil")
 	}
 }
@@ -109,7 +109,7 @@ func TestPrepare_ShortOKPacketIsAnErrorNotAPanic(t *testing.T) {
 	}()
 
 	c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
-	if _, err := c.prepare("SELECT 1", false); err == nil {
+	if _, err := c.prepare("SELECT 1"); err == nil {
 		t.Fatalf("expected an error for a short OK packet, got nil")
 	}
 }
