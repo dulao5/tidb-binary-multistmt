@@ -30,15 +30,12 @@ import (
 // (ambiguous — ExpandValues does not guess which one you meant), rows is
 // empty, or any row's length doesn't match the template's placeholder count.
 //
-// Every element of every row is still bound exactly the way a scalar
-// Statement.Args element always is — one value per flattened "?", sent as a
-// genuine COM_STMT_EXECUTE binary protocol parameter (see
-// buildExecutePayload), not formatted into the SQL text at all. ExpandValues
-// only rewrites placeholder text and reorders/flattens the Go values; it
-// never itself produces a SQL literal, so (unlike tidb-multistmt's
-// text-protocol SET-literal mechanism) there is no string-escaping behavior
-// here to get wrong in the first place — no NO_BACKSLASH_ESCAPES/legacy-
-// charset injection surface to worry about.
+// Every element of every row is bound exactly like a scalar Statement.Args
+// element — one value per flattened "?", sent as a genuine COM_STMT_EXECUTE
+// binary protocol parameter (see buildExecutePayload), never formatted into
+// the SQL text. ExpandValues only rewrites placeholder text and reorders
+// the Go values, so there is no string-escaping behavior here to get wrong
+// — no injection surface to worry about.
 func ExpandValues(sqlText string, rows [][]any) (string, []any, error) {
 	if len(rows) == 0 {
 		return "", nil, fmt.Errorf("binarymultistmt: ExpandValues: rows is empty")

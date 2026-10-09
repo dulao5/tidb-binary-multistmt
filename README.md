@@ -2,56 +2,45 @@
 
 English | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-Pipelines a transaction's statements over MySQL's **binary** protocol
-(`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`) with no per-statement network round
-trip, by writing every statement's `EXECUTE` packet back-to-back before
-reading any response — instead of `database/sql`'s (and
-[go-sql-driver/mysql](https://github.com/go-sql-driver/mysql)'s) normal
-write-command-then-synchronously-read-its-response convention.
+Sends every statement in a batch over MySQL's **binary** protocol
+(`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`) in a single network round trip,
+instead of one round trip per statement.
+
+## At a glance
+
+- **What**: write every statement's `EXECUTE` packet back-to-back, then read
+  all the responses — instead of `database/sql`'s normal
+  write-one-then-read-its-response convention.
+- **Benefit**: measured on a real TiDB Cloud cluster, this roughly halved
+  transaction P95 latency (62.4ms → 31.5ms) versus one round trip per
+  statement.
+- **Trade-off**: a statement's result is only visible through its
+  `Callback`, not afterward; only pessimistic transactions are supported;
+  TLS and protocol compression aren't supported yet. See
+  [Known limitations](#known-limitations).
 
 ## Why
 
-[tidb-multistmt](https://github.com/dulao5/tidb-multistmt) already solves
-"one round trip for N statements" using the **text** protocol: pack every
-statement into one semicolon-joined `COM_QUERY` blob
-(`CLIENT_MULTI_STATEMENTS`), with a `SET @_multistmt_statement_num=N` marker
-before each statement so the client can recover per-statement
-success/failure from a response stream that otherwise collapses that
-information.
+For a batch of N statements, this cuts N round trips down to one, because
+each `EXECUTE` already carries its own response, in order — the N-th
+response read off the wire *is* the N-th statement sent, for free, as long
+as the connection stays healthy.
 
-A real production CPU-profile diff found those marker `SET`s responsible for
-the large majority of multi-statement mode's extra CPU over plain
-one-statement-per-round-trip — not the text-vs-binary protocol choice itself.
-This package tries pipelined **binary** `EXECUTE` instead: no markers needed
-at all, because each `EXECUTE` is already a separate command with its own
-response, delivered in order — the N-th response you read off the wire *is*
-the N-th statement you sent, for free, as long as the connection stays
-healthy. Measured on a real TiDB Cloud cluster:
-
-| | normal (prepare + binary, one round trip per statement) | pipelined binary (this package) |
+| | one round trip per statement | pipelined (this package) |
 |---|---|---|
 | Txn P95 | 62.4ms | 31.5ms |
 | TiDB CPU | 205% | 195% |
 
-## How the connection is obtained
+### Background: why binary, not text
 
-MySQL command packets are self-delimited (length-prefixed) — nothing in the
-wire protocol or in TiDB's connection read loop requires a round trip
-between commands. The reason this isn't normally possible with
-`database/sql` is that no mainstream client exposes an API to write ahead of
-reading.
-
-This package doesn't fork go-sql-driver/mysql to get around that. A custom
-dial function, registered via the driver's own public
-`mysql.RegisterDialContext` hook, dials the real TCP connection and also
-pushes it into a channel this package reads from. go-sql-driver does its
-normal handshake/authentication over that connection; once `Dial` returns,
-authentication is done and this package takes over all reads/writes
-directly, outside `database/sql`. From that point the underlying
-`*sql.Conn`/`*sql.DB` pair is kept open only to hold the pool slot — they are
-never used through the driver API again, because this package's raw writes
-permanently desync the driver's internal per-connection sequence-number
-bookkeeping.
+[tidb-multistmt](https://github.com/dulao5/tidb-multistmt) already batches N
+statements into one round trip, over the **text** protocol: it joins them
+into one `COM_QUERY` blob and inserts a `SET @_multistmt_statement_num=N`
+marker before each statement, so per-statement success/failure survives a
+response stream that would otherwise collapse it. A production CPU-profile
+comparison found those marker `SET`s — not the text-vs-binary choice itself
+— responsible for most of multi-statement mode's extra CPU. This package
+pipelines binary `EXECUTE` instead, which needs no markers at all.
 
 ## Usage
 
@@ -103,69 +92,58 @@ default:
 }
 ```
 
-- Whether a statement is row-returning is detected automatically, from the
-  server's own `COM_STMT_PREPARE` response (its column-count field is `0`
-  for a non-row-returning statement) — unlike tidb-multistmt, the caller
-  never declares this and so can't get it wrong.
-- A statement's error and result are only ever visible through its
-  `Callback` (see below) — `Execute` keeps no per-statement record after the
-  batch finishes, so there's exactly one place to look, not two. `ExecuteResult`
-  itself carries nothing but `AllSucceeded`.
-- `Execute` auto-sends `COMMIT` only when every statement in the batch
-  succeeded. On any failure it does **not** send `ROLLBACK` — each failing
-  statement's `Callback` already saw the error as it happened, and the
-  transaction is left open for the caller to explicitly resolve. This
-  mirrors tidb-multistmt's own library/caller split: that library never
-  sends `ROLLBACK` either; its caller does.
-- A connection/protocol-level failure (as opposed to one statement's SQL
-  error or a `*CommitError`, below) makes `Execute` return a non-nil `error`
-  and leaves `conn` unusable — `Close` it and `Dial` a new one.
+A few things to know:
+
+- Whether a statement returns rows is detected automatically from the
+  server's own `COM_STMT_PREPARE` response — you never declare it, so you
+  can't get it wrong.
+- A statement's error and result are visible **only** through its
+  `Callback` (see below). `Execute` keeps no per-statement record
+  afterward — `ExecuteResult` carries nothing but `AllSucceeded`.
+- `Execute` sends `COMMIT` only if every statement succeeded. On any
+  failure it does **not** send `ROLLBACK` — the transaction stays open on
+  `conn` for you to resolve explicitly.
+- A connection/protocol-level failure (not a statement error, not a
+  `*CommitError`) makes `Execute` return a non-nil `error` and leaves
+  `conn` unusable — `Close` it and `Dial` a new one.
 - If every statement succeeds but the server then rejects `COMMIT` itself
-  (verified against a real conflict: TiDB already rolls the transaction back
-  server-side when this happens), `Execute` returns a non-nil `*CommitError`
-  (check with `errors.As`) alongside an `ExecuteResult` with `AllSucceeded`
-  false — `conn` is unaffected and stays usable, and there is nothing to
-  `Rollback`. This is a third, distinct outcome from "one statement failed"
-  and "the connection broke" — don't lump it in with either.
-- Only pessimistic transactions are supported, by design — **not** a
-  temporary gap. A mid-pipeline failure does not stop already-written
-  `EXECUTE`s from running (each is an independent command to the server — it
-  has no idea they're "one batch"), so row locks must already be held as
-  each statement runs, not deferred to commit, for "any failure → roll back
-  everything" to stay correct. Optimistic transactions defer conflict
-  detection to `COMMIT` (prewrite) time instead: a conflict there fails the
-  whole transaction at once, with no way to attribute it back to the one
-  statement that actually collided — which defeats the per-statement
-  `Callback` this package is built around. There is no plan to add
-  optimistic transaction support.
+  (e.g. a write conflict), `Execute` returns a `*CommitError` (check with
+  `errors.As`). TiDB has already rolled back server-side when this
+  happens — `conn` stays healthy, and there's nothing to roll back.
+- Only pessimistic transactions work here. A statement that fails
+  mid-pipeline doesn't stop the `EXECUTE`s already written from running (the
+  server has no idea they're "one batch"), so row locks must already be
+  held as each statement runs — not deferred to `COMMIT` — for "any failure
+  rolls back everything" to stay correct. Optimistic transactions push
+  conflict detection to `COMMIT` instead, where a conflict fails the whole
+  batch at once with no way to tell which statement caused it. This
+  package doesn't support optimistic transactions.
 
 ### `ExecuteAutoCommit`: skip `BEGIN`/`COMMIT` entirely
 
-`Execute` always costs two extra round trips beyond the pipelined
-`EXECUTE`s: a synchronous `BEGIN` before them, and (on full success) a
-synchronous `COMMIT` after. `ExecuteAutoCommit` is the same pipelining with
-neither — each statement commits on its own as it runs, exactly like
-issuing them one at a time with no explicit transaction (MySQL's
-session-default autocommit behavior):
+`Execute` costs two extra round trips beyond the pipelined `EXECUTE`s: a
+synchronous `BEGIN` before them, and (on success) a synchronous `COMMIT`
+after. `ExecuteAutoCommit` runs the same pipeline without either — each
+statement commits on its own as it runs, same as issuing them one at a time
+under MySQL's default autocommit:
 
 ```go
 res, err := conn.ExecuteAutoCommit(ctx, b)
 ```
 
-There is nothing to roll back afterward — **never call `Rollback` after
-`ExecuteAutoCommit`**; whatever already executed is already durable,
-successful or not. `*CommitError` cannot happen here either, since there's
-no `COMMIT` to reject. This fits a read-only batch, or one where a partial/
-failed write genuinely doesn't need undoing (e.g. best-effort logging).
-Anything that needs "every statement in this batch lands, or none do" must
-use `Execute` instead — that's still the right default when in doubt.
+There's nothing to roll back afterward — whatever ran already committed,
+successful or not, so calling `Rollback` would just be a harmless no-op.
+`*CommitError` can't happen here either, since there's no `COMMIT` to
+reject. Use this for a read-only batch, or one where a partial failure
+genuinely doesn't need undoing (e.g. best-effort logging). Use `Execute`
+instead whenever you need "every statement lands, or none do" — that's the
+safer default when in doubt.
 
 ### Connection pool (`DB`/`AcquireConn`)
 
 `Dial` hands out one dedicated connection per call — fine for a short-lived
-tool, wasteful for a long-running process that wants to pay the dial+auth
-cost once and reuse connections across many batches. `Open`/`AcquireConn`
-do that:
+tool, wasteful for a long-running process reusing connections across many
+batches. `Open`/`AcquireConn` fix that:
 
 ```go
 db, err := binarymultistmt.Open("user:pass@tcp(host:4000)/db", 40) // maxConns
@@ -181,30 +159,23 @@ b.Add(...)
 res, err := conn.Execute(ctx, b)
 ```
 
-`conn.Close()` here does not close the socket: it returns `conn` to `db`'s
-own idle list for the next `AcquireConn` call to reuse — unless `conn`
-suffered a connection/protocol-level failure (the same failures the `Dial`
-usage above tells you to discard the connection for), in which case `Close`
-destroys it instead, automatically, based on the `Conn`'s own internal
-bookkeeping. Either way, call `Close` exactly once and don't use `conn`
-afterward — same contract as a `Dial`-sourced `Conn`.
+`conn.Close()` here doesn't close the socket: it returns `conn` to `db`'s
+idle list for the next `AcquireConn` to reuse — unless `conn` suffered a
+connection/protocol-level failure, in which case `Close` destroys it
+instead, automatically. Either way, call `Close` exactly once and don't
+reuse `conn` afterward.
 
-This pool is deliberately not `database/sql`'s own connection pool: this
-package needs to know, with certainty, which physical connection it's about
-to speak raw binary protocol on, and `database/sql`'s pool has no API to
-tell a caller that up front for a connection it's reusing from its idle
-list. So the underlying `*sql.DB` inside `DB` is used only to dial and
-authenticate new physical connections; `AcquireConn`/`Close` implement
-their own idle-list reuse on top, where "is this the same physical
-connection as last time" is never in question because this package itself
-decides which `Conn` to hand back out.
+This pool is deliberately not `database/sql`'s own: this package needs to
+know *which* physical connection it's about to speak raw binary protocol
+on, and `database/sql`'s pool has no API to tell a caller that up front for
+a connection it's reusing from its idle list. So the `*sql.DB` inside `DB`
+only dials and authenticates; `AcquireConn`/`Close` implement their own
+idle-list reuse on top.
 
-If your program already has other code constructing its own `*sql.DB` the
-normal way, build it alongside — not from — a `binarymultistmt.DB`: the two
-are separate, independently-dialed connection pools, not two views onto one
-pool, and `*binarymultistmt.DB` is not a `*sql.DB` (doesn't embed one, isn't
-assignable to a `*sql.DB`-typed parameter/field). A typical setup has a
-factory function returning both from one dsn:
+If you already construct your own `*sql.DB` elsewhere, build it alongside —
+not from — a `binarymultistmt.DB`: they're two separate, independently
+dialed pools (`*binarymultistmt.DB` doesn't embed `*sql.DB` and isn't
+assignable to one). A typical setup returns both from one DSN:
 
 ```go
 func NewPools(dsn string) (plain *sql.DB, binary *binarymultistmt.DB, err error) {
@@ -216,18 +187,14 @@ func NewPools(dsn string) (plain *sql.DB, binary *binarymultistmt.DB, err error)
 }
 ```
 
-so most of the codebase keeps using `plain` (and its existing call sites
-don't change at all), while the specific code path that wants pipelined
-binary batches uses `binary.AcquireConn` instead.
+Most of the codebase keeps using `plain` unchanged; only the code path that
+wants pipelined binary batches uses `binary.AcquireConn`.
 
 ### Callback: handle each statement where it's queued, streaming its rows
 
 `Add`'s third argument, if non-nil, is invoked exactly once by `Execute`,
 synchronously, in queue order — right where that statement's response
-becomes available. This is the *only* way to see a statement's error or
-result: `Execute` keeps no per-statement record after the batch finishes
-(`ExecuteResult` carries nothing but `AllSucceeded`), so there's exactly one
-place to look, not two.
+becomes available:
 
 ```go
 b := binarymultistmt.NewBatch()
@@ -249,25 +216,22 @@ res, err := conn.Execute(ctx, b)
 For a row-returning statement (`sr.HasResultSet`), `sr.Rows` is a
 `*RowIterator` that reads and decodes rows directly off the wire as the
 callback calls `Next()` — `Execute` never buffers a result set into memory.
-A statement queued with a `nil` Callback still has its rows drained (to keep
-the pipelined stream in sync for later statements), they are just never
-decoded or exposed anywhere — so a row-returning statement whose result you
-care about needs a Callback.
+A statement queued with a `nil` Callback still has its rows drained (to
+keep later statements aligned on the wire), they're just never decoded or
+exposed — so a row-returning statement whose result you care about needs a
+Callback.
 
-The callback can also stop early (`break` after the first matching row, for
-example): whatever it leaves unread is drained automatically once it
-returns, so later statements in the same batch stay correctly aligned on the
-wire — the callback is never required to consume to EOF itself, unlike
-tidb-multistmt's `Callback`/`Rows` contract.
+The callback can also stop early (e.g. `break` after the first matching
+row) — whatever it leaves unread is drained automatically once it returns,
+so you never have to consume all the way to EOF yourself, and later
+statements in the batch stay correctly aligned regardless.
 
 A statement that fails before ever producing a result-set header (an ERR
-packet in place of one) still gets its callback invoked exactly once, with
-`sr.Rows == nil` and `sr.Err` set — `Execute`'s own bookkeeping guarantees
-"exactly once" regardless of which path a statement's response took.
+packet instead) still gets its callback invoked exactly once, with
+`sr.Rows == nil` and `sr.Err` set.
 
-`Next()` decodes one row per column in `sr.Rows.Columns()` (name/type/
-`Unsigned`/`Decimals`, decoded from the server's own column metadata), `nil`
-for SQL `NULL`. Go value types per MySQL column type:
+`Next()` decodes one row per column in `sr.Rows.Columns()`, `nil` for SQL
+`NULL`. Go value types per MySQL column type:
 
 | MySQL type family | Go type |
 |---|---|
@@ -275,12 +239,11 @@ for SQL `NULL`. Go value types per MySQL column type:
 | `FLOAT`/`DOUBLE` | `float64` |
 | `DATE`/`DATETIME`/`TIMESTAMP` | `time.Time` |
 | `TIME` | `time.Duration` (can be negative; MySQL `TIME` isn't bounded to 24h) |
-| `VARCHAR`/`TEXT`/`BLOB` family/`DECIMAL`/`JSON`/`ENUM`/`SET`/`BIT`/`GEOMETRY` | `[]byte` — this package doesn't know a column's charset well enough to decide when a `string` conversion is safe, so it leaves that (and its cost) to the caller |
+| `VARCHAR`/`TEXT`/`BLOB` family/`DECIMAL`/`JSON`/`ENUM`/`SET`/`BIT`/`GEOMETRY` | `[]byte` — this package doesn't know a column's charset, so it leaves the `string` conversion (and its cost) to the caller |
 
 ### `WHERE id IN (?)` / bulk `INSERT`
 
-Same two functions as tidb-multistmt, same calling convention — call before
-`Batch.Add`:
+Two helper functions — call them before `Batch.Add`:
 
 ```go
 sql, args, err := binarymultistmt.ExpandIn("SELECT c FROM t WHERE id IN (?)", []any{ids})
@@ -290,82 +253,86 @@ sql, args, err := binarymultistmt.ExpandValues("INSERT INTO t (id, c) VALUES (?,
 b.Add(sql, args, nil)
 ```
 
-As with tidb-multistmt, a variable-length `IN` list changes the rendered SQL
-text (and therefore this package's internal PREPARE cache key) with the
-list's length, so a call site whose length jitters a lot gets little benefit
-from PREPARE reuse — pad to a fixed set of bucket sizes yourself if that
-matters for your workload.
+A variable-length `IN` list changes the rendered SQL text (and so this
+package's internal PREPARE cache key) with the list's length, so a call
+site whose length jitters a lot gets little benefit from PREPARE reuse —
+pad to a fixed set of bucket sizes if that matters for your workload.
+
+## How it works
+
+MySQL command packets are self-delimited — nothing in the protocol
+requires a round trip between commands. `database/sql` just doesn't expose
+an API to write ahead of reading.
+
+This package doesn't fork go-sql-driver/mysql to get around that. It
+registers a custom dial function via the driver's own public
+[`mysql.RegisterDialContext`](https://github.com/go-sql-driver/mysql) hook,
+which captures the real `net.Conn` while go-sql-driver does its normal
+handshake/auth over it. Once `Dial` returns, authentication is done and
+this package takes over all reads/writes directly — the underlying
+`*sql.Conn`/`*sql.DB` is kept open only to hold the pool slot, and is never
+touched again through the driver API (this package's raw writes would
+desync the driver's internal per-connection packet-sequence bookkeeping).
 
 ## Status
 
-Experimental, ported from a benchmark originally embedded in
+Experimental, extracted from a benchmark originally embedded in
 [database_workload](https://github.com/dulao5/database_workload). Verified
-against a real TiDB (v8.5.8): pipelined inserts commit correctly, a
-duplicate-key failure mid-batch is attributed to the right statement index
-and leaves the transaction open for the caller's `Rollback`, a `SELECT` in
-the middle of a batch doesn't desync the statements after it, every
-supported parameter type round-trips correctly (read back through a normal
-driver connection, confirming TiDB itself understood the encoded values —
-not just that this package's own encode/decode is self-consistent),
-`ExpandIn`/`ExpandValues` compose correctly with the pipelined-binary
-execution path end to end, and a `SELECT` covering every supported column
-type (including an unsigned max value and a microsecond-precision
-`DATETIME`) decodes correctly through this package's own `RowIterator` —
-column metadata and row bytes TiDB actually sends, not hand-crafted
-fixtures. `ExecuteAutoCommit` is verified too: a later statement's failure
-does not roll back an earlier statement in the same batch, because there
-was never a transaction to roll back. `*CommitError` is verified against a
-genuine write conflict (two Conns racing an `UPDATE` under TiDB's optimistic
-transaction mode): the losing `Conn`'s `Execute` returns a `*CommitError`,
-and that same `Conn` is then confirmed still usable for another `Execute`
-call — no Close/Dial or Rollback needed.
+against a real TiDB (v8.5.8):
 
-Every entry point that parses bytes coming off the wire (`readPacket`,
+- pipelined inserts commit correctly; a duplicate-key failure mid-batch is
+  attributed to the right statement and leaves the transaction open for
+  `Rollback`
+- a `SELECT` in the middle of a batch doesn't desync the statements after it
+- every supported parameter type round-trips correctly, confirmed by
+  reading it back through a normal driver connection (not just this
+  package's own encode/decode being self-consistent)
+- `ExpandIn`/`ExpandValues` compose correctly with the pipelined execution
+  path end to end
+- a `SELECT` covering every supported column type (including an unsigned
+  max value and a microsecond-precision `DATETIME`) decodes correctly
+  through `RowIterator`, using real column metadata and row bytes from TiDB
+- `ExecuteAutoCommit`: a later statement's failure doesn't roll back an
+  earlier one in the same batch, because there was never a transaction to
+  roll back
+- `*CommitError`: reproduced against a genuine write conflict (two `Conn`s
+  racing an `UPDATE` under TiDB's optimistic transaction mode) — the losing
+  `Conn`'s `Execute` returns a `*CommitError`, and that same `Conn` is then
+  confirmed still usable for another `Execute` call
+
+Every entry point that parses bytes off the wire (`readPacket`,
 `decodeColumnDef`, `decodeBinaryRow`, `drainExecuteResponse`,
 `readOKorErr`) has a Go native fuzz target (`fuzz_test.go`) — CI runs each
-briefly on every push, and the full corpus (including past crashers) is
-replayed as ordinary deterministic tests on every `go test`. Fuzzing already
-found and fixed one real bug this way: an untrusted column count was used
-directly as a slice-capacity argument, panicking with "cap out of range" on
-a maliciously/accidentally huge value.
+briefly on every push, and the full corpus (including past crashers)
+replays as ordinary deterministic tests on every `go test`. Fuzzing already
+found and fixed one real bug this way: an untrusted column count used
+directly as a slice-capacity argument, panicking on a maliciously/
+accidentally huge value.
 
-Parameter binding uses genuine `COM_STMT_EXECUTE` binary protocol
-parameters throughout — including through `ExpandIn`/`ExpandValues` — never
-string-literal substitution, so (unlike tidb-multistmt's text-protocol
-`SET`-literal mechanism) there is no escaping-based injection surface to
-reason about here.
+Parameter binding always uses genuine `COM_STMT_EXECUTE` binary protocol
+parameters — never string-literal substitution — so there's no
+escaping-based injection surface to reason about here.
 
-**Known limitations** (tracked as issues in this repo):
+## Known limitations
 
-- **TLS is not supported yet.** The dial-hook hijack captures the net.Conn
-  *before* go-sql-driver/mysql wraps it in `tls.Client(...)` during the
-  handshake, so if the DSN requests TLS, this package ends up writing
-  plaintext binary-protocol bytes onto a connection the server expects to be
-  encrypted — a hard protocol break. Only use this package against
-  connections that don't require TLS (e.g. a private-network link) until
-  this is fixed.
-- **MySQL protocol compression (`compress=true`) is not supported either,
-  for the same reason as TLS** — the dial-hook hijack captures the net.Conn
-  before go-sql-driver/mysql would apply compression framing during the
-  handshake, so this package's raw `readPacket`/`writePacket` would desync
-  against a compressed stream the same way they would against a TLS one.
-  Paused alongside TLS; don't use `compress=true` until this is addressed.
+- **TLS is not supported yet.** The dial-hook captures the `net.Conn`
+  *before* go-sql-driver/mysql would wrap it in `tls.Client(...)` during
+  the handshake, so a TLS-requesting DSN ends up with this package writing
+  plaintext binary-protocol bytes onto a connection the server expects to
+  be encrypted. Only use this package where TLS isn't required (e.g. a
+  private-network link) until this is fixed.
+- **Protocol compression (`compress=true`) isn't supported either, for the
+  same reason as TLS** — the dial-hook captures the connection before
+  go-sql-driver/mysql would apply compression framing. Paused alongside
+  TLS.
 - **No `COM_STMT_SEND_LONG_DATA` support.** Every parameter value must fit
-  in a single packet (`maxPacketPayload`, ~16MB) — there's no fallback for
-  larger values the way go-sql-driver/mysql has. In practice this is a very
-  generous ceiling for normal column values; it only matters for genuinely
-  large BLOBs/TEXT.
-- **Assumes `CLIENT_DEPRECATE_EOF` is never negotiated.** This package's
-  `PREPARE`/`EXECUTE` response parsing expects EOF packets after
-  param-definition and column-definition lists, because it piggybacks on
-  go-sql-driver/mysql's handshake (via the dial-hook hijack above) and that
-  driver doesn't request `CLIENT_DEPRECATE_EOF` today — confirmed by reading
-  its source: the capability constant is defined but never set during
-  handshake. That's a coupling to a specific driver version's behavior, not
-  something this package independently negotiates or verifies. If you
-  vendor a different (or future) go-sql-driver/mysql version that *does*
-  start negotiating deprecate-EOF, check this before relying on this
-  package — the failure mode is a silent parse desync, not a loud error.
+  in a single packet (`maxPacketPayload`, ~16MB) — generous for normal
+  column values, but a real limit for large BLOBs/TEXT.
+- **Assumes `CLIENT_DEPRECATE_EOF` is never negotiated.** This package
+  piggybacks on go-sql-driver/mysql's handshake, and that driver doesn't
+  request this capability today (confirmed by reading its source). If you
+  vendor a driver version that does negotiate it, check this first — the
+  failure mode is a silent parse desync, not a loud error.
 
 ## License
 

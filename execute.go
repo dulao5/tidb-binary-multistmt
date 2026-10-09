@@ -464,9 +464,10 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 // then reading all responses — but never sends BEGIN or COMMIT. Each
 // statement commits on its own as it executes, the same as issuing them one
 // at a time with no explicit transaction (MySQL's session-default
-// autocommit behavior). There is no transaction to roll back afterward:
-// never call Rollback after ExecuteAutoCommit — whatever already executed
-// is already durable, successful or not.
+// autocommit behavior). There is no transaction to roll back afterward —
+// whatever already executed is already durable, successful or not — so
+// calling Rollback after ExecuteAutoCommit is unnecessary, though harmless
+// (it's a no-op with nothing open to roll back).
 //
 // This trades away the one thing Execute's BEGIN/COMMIT round trips buy —
 // all-or-nothing atomicity across the batch — for two fewer round trips per
@@ -587,12 +588,13 @@ func (c *Conn) execute(ctx context.Context, b *Batch, explicitTxn bool) (*Execut
 	return &ExecuteResult{AllSucceeded: allOK}, nil
 }
 
-// Rollback sends ROLLBACK on c. Call this after Execute (not
-// ExecuteAutoCommit, which has no transaction to roll back) returns an
-// ExecuteResult with AllSucceeded false AND a nil error (i.e. one of the
-// batch's statements failed) — before reusing c for another Batch. Do not
-// call it after a *CommitError: TiDB already rolled back server-side when
-// COMMIT was rejected, so there is nothing left to roll back.
+// Rollback sends ROLLBACK on c. Call this after Execute returns an
+// ExecuteResult with AllSucceeded false and a nil error (i.e. one of the
+// batch's statements failed), before reusing c for another Batch. It's
+// unnecessary — though harmless — after ExecuteAutoCommit (no transaction
+// was ever opened) or after a *CommitError (TiDB already rolled back
+// server-side when COMMIT was rejected): either way there's nothing left
+// to roll back, so Rollback is just a no-op in those cases.
 func (c *Conn) Rollback(ctx context.Context) error {
 	if err := writeComQuery(c.raw, "ROLLBACK"); err != nil {
 		c.broken = true

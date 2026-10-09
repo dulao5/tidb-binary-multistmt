@@ -4,6 +4,16 @@ API reference for [github.com/dulao5/tidb-binary-multistmt](https://github.com/d
 generated from the package's own Go doc comments. For the repository and
 issue tracker, see [the GitHub repo](https://github.com/dulao5/tidb-binary-multistmt).
 
+## At a glance
+
+Sends every statement in a batch over MySQL's binary protocol
+(`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`) in a single network round trip,
+instead of one round trip per statement — measured ~2x lower transaction
+P95 latency on a real TiDB Cloud cluster. A statement's error and result
+are only visible through its own `Callback`; only pessimistic transactions
+are supported; TLS and protocol compression aren't supported yet. See
+[Known limitations](https://github.com/dulao5/tidb-binary-multistmt#known-limitations).
+
 ## Quick example
 
 ```go
@@ -57,83 +67,63 @@ default:
 Each statement's error and result arrive through its own `Callback`
 (`sr.Err`, and for a row-returning statement `sr.Rows`, a `*RowIterator`
 streaming rows directly off the wire) — `Execute` keeps no per-statement
-record afterward, so this is the only place to look. See
-[Usage](#usage-one-shot-dial-or-a-pooled-dbacquireconn) below and the
+record afterward, so this is the only place to look. See the
 [repository README](https://github.com/dulao5/tidb-binary-multistmt#readme)
 for more worked examples (connection pooling, `IN (?)`/bulk `INSERT`).
 
-## Concept
+## Why
 
-Pipelines a transaction's statements over MySQL's **binary** protocol
-(`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`) with no per-statement network round
-trip, by writing every statement's `EXECUTE` packet back-to-back before
-reading any response — instead of `database/sql`'s (and
-[go-sql-driver/mysql](https://github.com/go-sql-driver/mysql)'s) normal
-write-command-then-synchronously-read-its-response convention.
+For a batch of N statements, this cuts N round trips down to one, because
+each `EXECUTE` already carries its own response, in order — the N-th
+response read off the wire *is* the N-th statement sent, for free, as long
+as the connection stays healthy.
 
-[tidb-multistmt](https://github.com/dulao5/tidb-multistmt) already solves
-"one round trip for N statements" using the **text** protocol, at the cost of
-a `SET @_multistmt_statement_num=N` marker before each statement so the
-client can recover per-statement success/failure from a response stream that
-otherwise collapses that information. A real production CPU-profile diff
-found those marker `SET`s responsible for the large majority of
-multi-statement mode's extra CPU over plain one-statement-per-round-trip —
-not the text-vs-binary protocol choice itself. This package pipelines binary
-`EXECUTE` instead: no markers needed at all, because each `EXECUTE` is
-already a separate command with its own response, delivered in order — the
-N-th response you read off the wire *is* the N-th statement you sent, for
-free, as long as the connection stays healthy.
+| | one round trip per statement | pipelined (this package) |
+|---|---|---|
+| Txn P95 | 62.4ms | 31.5ms |
+| TiDB CPU | 205% | 195% |
 
-MySQL command packets are self-delimited (length-prefixed) — nothing in the
-wire protocol or in TiDB's connection read loop requires a round trip between
-commands. This package doesn't fork go-sql-driver/mysql to exploit that: a
-custom dial function, registered via the driver's own public
-`mysql.RegisterDialContext` hook, dials the real TCP connection and hands it
-to this package once the driver's own handshake/authentication over it is
-done; from that point this package takes over all reads/writes directly,
+MySQL command packets are self-delimited — nothing in the protocol
+requires a round trip between commands. `database/sql` just doesn't expose
+an API to write ahead of reading. This package doesn't fork
+go-sql-driver/mysql to get around that: a custom dial function, registered
+via the driver's own public `mysql.RegisterDialContext` hook, captures the
+real `net.Conn` while go-sql-driver does its normal handshake/auth over it.
+Once `Dial` returns, this package takes over all reads/writes directly,
 outside `database/sql`.
 
-## Usage: one-shot `Dial`, or a pooled `DB`/`AcquireConn`
+## Behavior to know before using it
 
-`Dial` hands out one dedicated connection per call — fine for a short-lived
-tool. A long-running process that wants to pay the dial+auth cost once and
-reuse connections across many batches should use `Open`/`AcquireConn`
-instead, which implement this package's own idle-connection pool on top of
-an internal `*sql.DB` used only for dialing — `database/sql`'s own pool has
-no API to tell a caller, with certainty, which physical connection it's
-about to speak raw binary protocol on, so this package never hands that
-decision to it. `*binarymultistmt.DB` is a separate, independently-dialed
-pool, not a view onto an existing `*sql.DB` — it doesn't embed one and isn't
-assignable to a `*sql.DB`-typed parameter/field.
-
-Both paths share the same contract: whether a statement is row-returning is
-detected automatically from the server's own `COM_STMT_PREPARE` response, so
-the caller never declares it and can't get it wrong. `Execute` auto-sends
-`COMMIT` only when every statement succeeded; on any failure it does **not**
-send `ROLLBACK` — each failing statement's `Callback` already saw the error
-as it happened, and the transaction is left open for the caller to
-explicitly resolve. A connection/protocol-level failure (as opposed to one
-statement's SQL error, or a `*CommitError`) makes `Execute` return a non-nil
-`error` and leaves the connection unusable — `Close` it (or let a pooled
-`Conn`'s own `Close` discard it automatically) rather than reusing it.
+Whether a statement is row-returning is detected automatically from the
+server's own `COM_STMT_PREPARE` response — the caller never declares it.
+`Execute` auto-sends `COMMIT` only when every statement succeeded; on any
+failure it does **not** send `ROLLBACK` — each failing statement's
+`Callback` already saw the error, and the transaction is left open for the
+caller to resolve explicitly. A connection/protocol-level failure (as
+opposed to one statement's SQL error, or a `*CommitError`) makes `Execute`
+return a non-nil `error` and leaves the connection unusable — `Close` it
+(or let a pooled `Conn`'s own `Close` discard it automatically).
 
 If every statement succeeds but the server then rejects `COMMIT` itself
 (verified against a real conflict: TiDB already rolls the transaction back
 server-side when this happens), `Execute` returns a non-nil `*CommitError`
 instead — the connection is unaffected and stays usable, and there's
-nothing to `Rollback`. This is a third, distinct outcome from "one statement
-failed" and "the connection broke."
+nothing to roll back.
 
 `ExecuteAutoCommit` pipelines the same way but never sends `BEGIN`/`COMMIT`
-— each statement commits on its own, with nothing to `Rollback` afterward.
-Use it for a read-only batch, or one where a partial failure genuinely
-doesn't need undoing; `Execute` is still the right default whenever a batch
-needs all-or-nothing atomicity. Only pessimistic transactions are supported,
-by design: optimistic transactions defer conflict detection to `COMMIT`
-time, which would fail a whole batch at once with no way to attribute the
-conflict back to one statement — defeating the per-statement `Callback` this
-package is built around. There is no plan to add optimistic transaction
-support.
+— each statement commits on its own. There's nothing to roll back
+afterward (calling `Rollback` would just be a harmless no-op, since
+whatever ran already committed). Use it for a read-only batch, or one
+where a partial failure genuinely doesn't need undoing; `Execute` is still
+the right default whenever a batch needs all-or-nothing atomicity.
+
+Only pessimistic transactions are supported, by design: a failed statement
+mid-pipeline doesn't stop already-written `EXECUTE`s from running, so row
+locks must already be held as each statement runs, not deferred to commit.
+Optimistic transactions defer conflict detection to `COMMIT` instead, which
+would fail a whole batch at once with no way to attribute the conflict back
+to one statement — defeating the per-statement `Callback` this package is
+built around.
 
 See the README's
 [Usage](https://github.com/dulao5/tidb-binary-multistmt#usage),
@@ -144,15 +134,13 @@ each piece individually.
 
 ## Array args: `IN (?)` and bulk `INSERT`
 
-Same two functions as tidb-multistmt, same calling convention: `ExpandIn`
-expands a single `?` into a comma-separated run for `WHERE col IN (?)`;
-`ExpandValues` expands a single-row `VALUES (?, ?)` template into one copy
-per row for bulk inserts. Both are plain functions — call them before
-`Batch.Add`, nothing else changes. Unlike tidb-multistmt's text-protocol
-`SET`-literal mechanism, parameter binding here always uses genuine
-`COM_STMT_EXECUTE` binary protocol parameters, including through
-`ExpandIn`/`ExpandValues`, so there is no escaping-based injection surface to
-reason about. See the README's
+`ExpandIn` expands a single `?` into a comma-separated run for
+`WHERE col IN (?)`; `ExpandValues` expands a single-row `VALUES (?, ?)`
+template into one copy per row for bulk inserts. Both are plain functions
+— call them before `Batch.Add`, nothing else changes. Parameter binding
+always uses genuine `COM_STMT_EXECUTE` binary protocol parameters,
+including through these two functions, so there is no escaping-based
+injection surface to reason about. See the README's
 [`WHERE id IN (?)` / bulk `INSERT`](https://github.com/dulao5/tidb-binary-multistmt#where-id-in--bulk-insert)
 section for the full examples and the PREPARE-cache-key caveat around
 variable-length `IN` lists.
@@ -167,7 +155,7 @@ also no `COM_STMT_SEND_LONG_DATA` support (every parameter must fit in one
 ~16MB packet), and this package assumes `CLIENT_DEPRECATE_EOF` is never
 negotiated, coupling it to go-sql-driver/mysql's current handshake behavior.
 See the README's
-[Status](https://github.com/dulao5/tidb-binary-multistmt#status) section for
-the full list and the reasoning behind each.
+[Known limitations](https://github.com/dulao5/tidb-binary-multistmt#known-limitations)
+section for the full list and the reasoning behind each.
 
 ---
