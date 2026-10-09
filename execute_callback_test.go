@@ -1,9 +1,11 @@
 package binarymultistmt
 
 import (
+	"container/list"
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -44,7 +46,7 @@ func TestPrepare_DerivesHasResultSetFromColumnCount(t *testing.T) {
 			readPacket(server) // drain COM_STMT_PREPARE
 			writeRawPacket(server, 0, buildPrepareOKPacket(1, 0, 0))
 		}()
-		c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
+		c := &Conn{raw: client, stmtCache: make(map[string]*list.Element), stmtLRU: list.New()}
 		ps, err := c.prepare("INSERT INTO t VALUES (1)")
 		if err != nil {
 			t.Fatalf("prepare: %v", err)
@@ -62,7 +64,7 @@ func TestPrepare_DerivesHasResultSetFromColumnCount(t *testing.T) {
 			writeRawPacket(server, 0, buildColumnDefPacket("a", colTypeLongLong, false))
 			writeRawPacket(server, 0, []byte{0xFE, 0x00, 0x00}) // EOF after column defs
 		}()
-		c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
+		c := &Conn{raw: client, stmtCache: make(map[string]*list.Element), stmtLRU: list.New()}
 		ps, err := c.prepare("SELECT a FROM t")
 		if err != nil {
 			t.Fatalf("prepare: %v", err)
@@ -145,14 +147,21 @@ func TestExecute_CallbackFiresExactlyOnce(t *testing.T) {
 		writeRawPacket(server, 0, buildColumnDefPacket("b", colTypeLongLong, false))
 		writeRawPacket(server, 0, []byte{0xFE, 0x00, 0x00})
 
-		// BEGIN
+		// BEGIN is now pipelined together with the EXECUTEs below rather
+		// than written-then-synchronously-read on its own, so the client
+		// writes it and all three EXECUTEs back-to-back before reading any
+		// response — read all four commands here before writing anything
+		// back (a real buffered TCP socket lets the server do this
+		// naturally; net.Pipe doesn't buffer, so writing BEGIN's response
+		// before this point would deadlock against the client's own
+		// not-yet-flushed EXECUTE writes).
+		readPacket(server) // BEGIN
 		readPacket(server)
-		writeRawPacket(server, 0, []byte{0x00})
+		readPacket(server)
+		readPacket(server)
 
-		// all three EXECUTEs are written back-to-back before any response
-		readPacket(server)
-		readPacket(server)
-		readPacket(server)
+		// BEGIN: OK
+		writeRawPacket(server, 0, []byte{0x00})
 
 		// response #0: a 2-row result set
 		writeRawPacket(server, 0, []byte{0x01})
@@ -169,7 +178,7 @@ func TestExecute_CallbackFiresExactlyOnce(t *testing.T) {
 		writeRawPacket(server, 0, buildErrPacket(1105, "stmt2 failed"))
 	}()
 
-	c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
+	c := &Conn{raw: client, stmtCache: make(map[string]*list.Element), stmtLRU: list.New()}
 
 	var (
 		cb0, cb1, cb2 bool
@@ -247,7 +256,7 @@ func TestExecuteAutoCommit_SkipsBeginAndCommit(t *testing.T) {
 		writeRawPacket(server, 0, []byte{0x00}) // OK for the EXECUTE
 	}()
 
-	c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
+	c := &Conn{raw: client, stmtCache: make(map[string]*list.Element), stmtLRU: list.New()}
 	b := NewBatch().Add("INSERT INTO t VALUES (1)", nil, nil)
 	res, err := c.ExecuteAutoCommit(context.Background(), b)
 	if err != nil {
@@ -273,17 +282,21 @@ func TestExecute_CommitRejectionReturnsCommitErrorAndKeepsConnHealthy(t *testing
 		readPacket(server) // drain COM_STMT_PREPARE
 		writeRawPacket(server, 0, buildPrepareOKPacket(1, 0, 0))
 
-		readPacket(server) // BEGIN
-		writeRawPacket(server, 0, []byte{0x00})
-
+		// BEGIN and the single EXECUTE are pipelined together (see
+		// TestExecute_CallbackFiresExactlyOnce's comment on why both reads
+		// must happen before either response is written), but COMMIT is
+		// written only afterward, once Execute already knows allOK — so
+		// it's still its own separate read/write here.
+		readPacket(server)                      // BEGIN
 		readPacket(server)                      // EXECUTE
-		writeRawPacket(server, 0, []byte{0x00}) // OK — the statement itself succeeded
+		writeRawPacket(server, 0, []byte{0x00}) // BEGIN: OK
+		writeRawPacket(server, 0, []byte{0x00}) // EXECUTE: OK — the statement itself succeeded
 
 		readPacket(server) // COMMIT
 		writeRawPacket(server, 0, buildErrPacket(9007, "Write conflict"))
 	}()
 
-	c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
+	c := &Conn{raw: client, stmtCache: make(map[string]*list.Element), stmtLRU: list.New()}
 	b := NewBatch().Add("INSERT INTO t VALUES (1)", nil, nil)
 	res, err := c.Execute(context.Background(), b)
 
@@ -299,5 +312,76 @@ func TestExecute_CommitRejectionReturnsCommitErrorAndKeepsConnHealthy(t *testing
 	}
 	if c.broken {
 		t.Fatalf("expected c to remain usable after a *CommitError — COMMIT's ERR response means the wire round-tripped fine")
+	}
+}
+
+// TestPrepare_EvictsLeastRecentlyUsedPastCacheLimit confirms prepare()
+// enforces c.stmtCacheLimit with real LRU eviction (not FIFO): touching "a"
+// again before "c" is prepared keeps "a" alive and makes "b" the
+// least-recently-used entry, so it's "b" — not "a" — that gets a
+// COM_STMT_CLOSE sent for it once the limit is exceeded.
+func TestPrepare_EvictsLeastRecentlyUsedPastCacheLimit(t *testing.T) {
+	client, server := pipePair(t)
+	// closeReport carries what the server goroutine saw for the
+	// COM_STMT_CLOSE packet back to the test's own goroutine — this test
+	// follows bounds_test.go's pipePair convention of never calling
+	// t.Fatalf/Errorf from inside the server goroutine (go vet flags that,
+	// and it would race with the main goroutine's own asserts below).
+	type closeReport struct {
+		stmtID uint32
+		err    error
+	}
+	closeReportCh := make(chan closeReport, 1)
+	go func() {
+		readPacket(server) // PREPARE "a"
+		writeRawPacket(server, 0, buildPrepareOKPacket(1, 0, 0))
+		readPacket(server) // PREPARE "b"
+		writeRawPacket(server, 0, buildPrepareOKPacket(2, 0, 0))
+		// re-PREPARE "a" is a client-side cache hit — no wire traffic for it.
+
+		readPacket(server) // PREPARE "c" — pushes the cache past its limit of 2
+		writeRawPacket(server, 0, buildPrepareOKPacket(3, 0, 0))
+
+		pkt, err := readPacket(server) // the COM_STMT_CLOSE this eviction should trigger
+		if err != nil {
+			closeReportCh <- closeReport{err: err}
+			return
+		}
+		if len(pkt) != 5 || pkt[0] != comStmtClose {
+			closeReportCh <- closeReport{err: fmt.Errorf("expected a 5-byte COM_STMT_CLOSE packet, got % x", pkt)}
+			return
+		}
+		closeReportCh <- closeReport{stmtID: binary.LittleEndian.Uint32(pkt[1:5])}
+	}()
+
+	c := &Conn{raw: client, stmtCache: make(map[string]*list.Element), stmtLRU: list.New(), stmtCacheLimit: 2}
+	if _, err := c.prepare("a"); err != nil {
+		t.Fatalf("prepare a: %v", err)
+	}
+	if _, err := c.prepare("b"); err != nil {
+		t.Fatalf("prepare b: %v", err)
+	}
+	if _, err := c.prepare("a"); err != nil { // touch "a" — "b" is now the LRU entry
+		t.Fatalf("re-prepare a: %v", err)
+	}
+	if _, err := c.prepare("c"); err != nil {
+		t.Fatalf("prepare c: %v", err)
+	}
+
+	report := <-closeReportCh
+	if report.err != nil {
+		t.Fatalf("server side: %v", report.err)
+	}
+	if report.stmtID != 2 {
+		t.Fatalf("expected COM_STMT_CLOSE for stmt id 2 (\"b\"), got %d", report.stmtID)
+	}
+	if _, stillCached := c.stmtCache["b"]; stillCached {
+		t.Fatalf("expected \"b\" to be evicted from the client-side cache too")
+	}
+	if _, stillCached := c.stmtCache["a"]; !stillCached {
+		t.Fatalf("expected \"a\" to survive eviction — it was touched more recently than \"b\"")
+	}
+	if c.stmtLRU.Len() != 2 {
+		t.Fatalf("expected stmtLRU to hold exactly 2 entries after eviction, got %d", c.stmtLRU.Len())
 	}
 }

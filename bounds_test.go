@@ -2,6 +2,7 @@ package binarymultistmt
 
 import (
 	"bytes"
+	"container/list"
 	"net"
 	"testing"
 	"time"
@@ -93,7 +94,7 @@ func TestPrepare_EmptyResponseIsAnErrorNotAPanic(t *testing.T) {
 		writeRawPacket(server, 1, nil)
 	}()
 
-	c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
+	c := &Conn{raw: client, stmtCache: make(map[string]*list.Element), stmtLRU: list.New()}
 	if _, err := c.prepare("SELECT 1"); err == nil {
 		t.Fatalf("expected an error for an empty prepare response, got nil")
 	}
@@ -108,7 +109,7 @@ func TestPrepare_ShortOKPacketIsAnErrorNotAPanic(t *testing.T) {
 		writeRawPacket(server, 1, []byte{0x00, 0x01, 0x02})
 	}()
 
-	c := &Conn{raw: client, stmtCache: make(map[string]preparedStmt)}
+	c := &Conn{raw: client, stmtCache: make(map[string]*list.Element), stmtLRU: list.New()}
 	if _, err := c.prepare("SELECT 1"); err == nil {
 		t.Fatalf("expected an error for a short OK packet, got nil")
 	}

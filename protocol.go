@@ -10,6 +10,7 @@ const (
 	comQuery       = 0x03
 	comStmtPrepare = 0x16
 	comStmtExecute = 0x17
+	comStmtClose   = 0x19
 
 	fieldTiny     = 0x01
 	fieldLongLong = 0x08

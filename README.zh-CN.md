@@ -103,9 +103,12 @@ default:
 
 ### `ExecuteAutoCommit`：完全跳过 `BEGIN`/`COMMIT`
 
-`Execute` 总会比 pipeline 本身多花两次往返：之前同步等一次
-`BEGIN`，成功之后再同步等一次 `COMMIT`。`ExecuteAutoCommit`
-跑的是同一套 pipeline，但两者都不发——每条语句在自己执行的时候就各自提交，跟不开显式事务、逐条发语句一样（MySQL
+`Execute` 发 `BEGIN` 的时候，是跟 batch 里的 `EXECUTE`
+一起 pipeline 发出去的——不是单独写完就同步等一次往返。所以只要每条语句都已经
+prepare 过（复用一条连接时的常见情况；见下面的[预处理语句缓存](#预处理语句缓存)），`Execute`
+比起 pipeline 本身只多花一次往返：成功之后同步等一次
+`COMMIT`。`ExecuteAutoCommit` 跑的是同一套 pipeline，但连
+`BEGIN`/`COMMIT` 都不发——每条语句在自己执行的时候就各自提交，跟不开显式事务、逐条发语句一样（MySQL
 默认的 autocommit 行为）：
 
 ```go
@@ -163,6 +166,29 @@ func NewPools(dsn string) (plain *sql.DB, binary *binarymultistmt.DB, err error)
 
 代码库里大部分地方继续用 `plain`，不用改；只有想用 pipelined binary batch
 的代码路径才用 `binary.AcquireConn`。
+
+### 预处理语句缓存
+
+同一条 SQL 文本，一个 `Conn` 只会发一次 `COM_STMT_PREPARE`；之后每次用同样的文本
+`Add`，都会复用缓存好的语句 ID。这个缓存跟 `Conn` 本身同生命周期（不管中间经过多少次
+`Execute`，如果是从连接池来的，也不管经过多少轮 `AcquireConn`/`Close`），按
+SQL 文本的原文做 key——这对动态拼出来的文本（比如下面
+[`ExpandIn`/`ExpandValues` 那一节](#where-id-in---批量-insert)）意味着什么，见那一节。
+
+超过 `SetStmtCacheLimit` 设的条数（默认 90）之后，每加一条新语句就会淘汰最近最少用的那条，并对它发
+`COM_STMT_CLOSE`——这样不管是本库自己的 map 还是服务端的 prepared statement
+表，都不会在一条长期存活的 `Conn` 上无限涨下去。90 这个默认值刻意比 TiDB 自己的默认值
+`tidb_session_plan_cache_size`（每个 session 100 条计划，以 v8.5 为准）略低一点——因为本库会独占这条连接，那个
+session 的 plan cache 里存的全是本库自己 prepare 出来的计划，所以客户端缓存稍微留点余量，能保证淘汰顺序由这条
+`Conn` 自己的 LRU 决定，而不是偶尔跟服务端自己的淘汰撞车：
+
+```go
+conn.SetStmtCacheLimit(50) // 比如用来匹配一个非默认的 tidb_session_plan_cache_size
+```
+
+要在 `Dial`/`AcquireConn` 之后、第一次 `Execute` 之前调用——它只影响之后
+`prepare()` 做的淘汰。`n <= 0` 会彻底关掉淘汰（缓存——以及它背后服务端的 prepared
+statement 表——会无限增长）。
 
 ### Callback：在语句排队的地方就地处理，并流式读取结果
 
@@ -223,13 +249,21 @@ b.Add(sql, args, nil)
 
 变长的 `IN` 列表会随着长度改变渲染出来的 SQL 文本（也就跟着改变了本库内部
 PREPARE 缓存用的 key），所以如果某个调用点的列表长度经常变化，从 PREPARE
-复用里获得的收益会很有限——如果这对你的负载很重要，自己把长度 pad
+复用里获得的收益会很有限——超过
+[`SetStmtCacheLimit`](#预处理语句缓存) 之后还会主动把 LRU
+搅乱（每种不同长度都会淘汰一条旧的、冷
+`PREPARE` 一条新的）。如果这对你的负载很重要，自己把长度 pad
 成固定的几档桶大小。
 
 ## 工作原理
 
 MySQL 的命令包都自带长度前缀、自分隔——协议本身并不要求命令之间必须有一次往返。`database/sql`
 只是没有暴露"先写后读"这种 API。
+
+`BEGIN`（一条 `COM_QUERY`）跟它后面 pipeline 的 `COM_STMT_EXECUTE`
+适用的是同一个道理：`Execute` 会把 `BEGIN` 和 batch 里每条语句的
+`EXECUTE` 连续写完，再按顺序依次读 `BEGIN` 的响应和每条 `EXECUTE`
+的响应——而不是先等 `BEGIN` 自己的 OK 回来才去写别的。本库早期版本里"要多花两次往返"说的就是后面这种写法。
 
 本库没有去 fork go-sql-driver/mysql 绕开这个限制，而是通过驱动自己公开的
 [`mysql.RegisterDialContext`](https://github.com/go-sql-driver/mysql)
@@ -253,6 +287,9 @@ MySQL 的命令包都自带长度前缀、自分隔——协议本身并不要�
 - `*CommitError`：用一次真实的写冲突验证过（两个 `Conn` 在 TiDB 的乐观事务模式下并发
   `UPDATE` 同一行）——输掉冲突那个 `Conn` 的 `Execute` 会返回
   `*CommitError`，而且确认这同一个 `Conn` 之后还能正常发起另一次 `Execute`
+- `BEGIN` 跟 batch 里的 `EXECUTE` 一起 pipeline 发出去（而不是单独写完同步等一次）照样能正确提交事务
+- 从 `SetStmtCacheLimit` 的 LRU 缓存里被淘汰（并被 `COM_STMT_CLOSE`
+  掉）的语句，下次在同一个 `Conn` 上复用同样的 SQL 文本时，能正常重新 prepare 并执行
 
 每一个解析 wire 上字节的入口（`readPacket`、`decodeColumnDef`、`decodeBinaryRow`、`drainExecuteResponse`、`readOKorErr`）都配有一个
 Go 原生 fuzz target（`fuzz_test.go`）——CI 每次 push 都会短暂跑一下，完整语料库（包括过去发现过的崩溃用例）每次

@@ -121,11 +121,15 @@ A few things to know:
 
 ### `ExecuteAutoCommit`: skip `BEGIN`/`COMMIT` entirely
 
-`Execute` costs two extra round trips beyond the pipelined `EXECUTE`s: a
-synchronous `BEGIN` before them, and (on success) a synchronous `COMMIT`
-after. `ExecuteAutoCommit` runs the same pipeline without either — each
-statement commits on its own as it runs, same as issuing them one at a time
-under MySQL's default autocommit:
+`Execute` sends `BEGIN` pipelined together with the batch's `EXECUTE`s —
+not as its own separate write-then-wait round trip — so once every
+statement is already prepared (the common case on a reused `Conn`; see
+[Prepared-statement cache](#prepared-statement-cache) below), `Execute`
+costs exactly one round trip more than the pipelined `EXECUTE`s themselves:
+a synchronous `COMMIT` on success. `ExecuteAutoCommit` runs the same
+pipeline without `BEGIN`/`COMMIT` at all — each statement commits on its own
+as it runs, same as issuing them one at a time under MySQL's default
+autocommit:
 
 ```go
 res, err := conn.ExecuteAutoCommit(ctx, b)
@@ -189,6 +193,36 @@ func NewPools(dsn string) (plain *sql.DB, binary *binarymultistmt.DB, err error)
 
 Most of the codebase keeps using `plain` unchanged; only the code path that
 wants pipelined binary batches uses `binary.AcquireConn`.
+
+### Prepared-statement cache
+
+A `Conn` only sends `COM_STMT_PREPARE` for a given SQL text once; every
+later `Add` with the same text reuses the cached statement ID. The cache
+lives as long as the `Conn` does (through however many `Execute` calls, and
+however many `AcquireConn`/`Close` round trips if it's pool-sourced) and is
+keyed by exact SQL text — see [the `ExpandIn`/`ExpandValues`
+section](#where-id-in---bulk-insert) below for what that implies for
+dynamically generated text.
+
+Past `SetStmtCacheLimit` entries (90 by default), adding a new statement
+evicts the least-recently-used one and sends `COM_STMT_CLOSE` for it, so
+neither this package's own map nor the server's prepared-statement table
+grows without bound on a long-lived `Conn`. 90 sits just under TiDB's own
+default `tidb_session_plan_cache_size` (100 plans per session, as of
+v8.5) — since this package hijacks its connection for exclusive use, that
+session's plan cache holds nothing but plans for statements this `Conn`
+itself prepared, so keeping the client-side cache a bit smaller keeps this
+`Conn`'s own LRU the one deciding evictions, rather than occasionally
+racing the server's:
+
+```go
+conn.SetStmtCacheLimit(50) // e.g. to match a non-default tidb_session_plan_cache_size
+```
+
+Call it right after `Dial`/`AcquireConn`, before the first `Execute` — it
+only governs evictions `prepare()` performs afterward. `n <= 0` disables
+eviction entirely (the cache — and the server's prepared-statement table
+behind it — grows without bound).
 
 ### Callback: handle each statement where it's queued, streaming its rows
 
@@ -255,14 +289,24 @@ b.Add(sql, args, nil)
 
 A variable-length `IN` list changes the rendered SQL text (and so this
 package's internal PREPARE cache key) with the list's length, so a call
-site whose length jitters a lot gets little benefit from PREPARE reuse —
-pad to a fixed set of bucket sizes if that matters for your workload.
+site whose length jitters a lot gets little benefit from PREPARE reuse — and
+past [`SetStmtCacheLimit`](#prepared-statement-cache), actively thrashes the
+LRU (each distinct length both evicts an older entry and cold-`PREPARE`s a
+new one). Pad to a fixed set of bucket sizes if that matters for your
+workload.
 
 ## How it works
 
 MySQL command packets are self-delimited — nothing in the protocol
 requires a round trip between commands. `database/sql` just doesn't expose
 an API to write ahead of reading.
+
+This applies just as much to `BEGIN` (a `COM_QUERY`) as to a `COM_STMT_EXECUTE`
+pipelined behind it: `Execute` writes `BEGIN` and every statement's `EXECUTE`
+in one unbroken sequence, then reads `BEGIN`'s response followed by each
+`EXECUTE`'s in order — rather than waiting for `BEGIN`'s own OK before
+writing anything else, which is where the "two round trips" in older
+versions of this package came from.
 
 This package doesn't fork go-sql-driver/mysql to get around that. It
 registers a custom dial function via the driver's own public
@@ -299,6 +343,12 @@ against a real TiDB (v8.5.8):
   racing an `UPDATE` under TiDB's optimistic transaction mode) — the losing
   `Conn`'s `Execute` returns a `*CommitError`, and that same `Conn` is then
   confirmed still usable for another `Execute` call
+- `BEGIN` pipelined together with the batch's `EXECUTE`s (not written and
+  synchronously awaited on its own) still produces a correct, committed
+  transaction
+- a statement evicted from `SetStmtCacheLimit`'s LRU cache (and
+  `COM_STMT_CLOSE`'d for it) prepares and runs correctly the next time its
+  SQL text is reused on the same `Conn`
 
 Every entry point that parses bytes off the wire (`readPacket`,
 `decodeColumnDef`, `decodeBinaryRow`, `drainExecuteResponse`,

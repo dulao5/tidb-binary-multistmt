@@ -195,6 +195,7 @@ See the package README for status, known limitations \(most notably: TLS is not 
   - [func \(c \*Conn\) Execute\(ctx context.Context, b \*Batch\) \(\*ExecuteResult, error\)](<#Conn.Execute>)
   - [func \(c \*Conn\) ExecuteAutoCommit\(ctx context.Context, b \*Batch\) \(\*ExecuteResult, error\)](<#Conn.ExecuteAutoCommit>)
   - [func \(c \*Conn\) Rollback\(ctx context.Context\) error](<#Conn.Rollback>)
+  - [func \(c \*Conn\) SetStmtCacheLimit\(n int\)](<#Conn.SetStmtCacheLimit>)
 - [type DB](<#DB>)
   - [func Open\(dsn string, maxConns int\) \(\*DB, error\)](<#Open>)
   - [func \(db \*DB\) AcquireConn\(ctx context.Context\) \(\*Conn, error\)](<#DB.AcquireConn>)
@@ -343,7 +344,7 @@ func (e *CommitError) Unwrap() error
 
 
 <a name="Conn"></a>
-## type [Conn](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L51-L58>)
+## type [Conn](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L66-L76>)
 
 Conn is one physical connection, hijacked for direct binary\-protocol pipelining after go\-sql\-driver/mysql establishes it. Not safe for concurrent use — mirrors a single \*sql.Conn's single\-writer assumption.
 
@@ -354,7 +355,7 @@ type Conn struct {
 ```
 
 <a name="Dial"></a>
-### func [Dial](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L73>)
+### func [Dial](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L107>)
 
 ```go
 func Dial(ctx context.Context, dsn string) (*Conn, error)
@@ -363,7 +364,7 @@ func Dial(ctx context.Context, dsn string) (*Conn, error)
 Dial opens dsn \(a standard go\-sql\-driver/mysql DSN\) via the driver's normal handshake/auth, then hijacks the underlying net.Conn for direct binary\-protocol use. The returned Conn owns that connection for its lifetime; call Close when done.
 
 <a name="Conn.Close"></a>
-### func \(\*Conn\) [Close](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L141>)
+### func \(\*Conn\) [Close](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L177>)
 
 ```go
 func (c *Conn) Close() error
@@ -372,7 +373,7 @@ func (c *Conn) Close() error
 Close releases c. For a Dial\-sourced Conn this destroys the connection and its dedicated factory \*sql.DB. For an AcquireConn\-sourced Conn, it instead returns c to its DB's own idle pool for reuse by a later AcquireConn call — unless c suffered a connection/protocol\-level failure \(see Execute/Rollback's doc comments\), in which case it is destroyed instead. Either way, c must not be used after Close.
 
 <a name="Conn.Execute"></a>
-### func \(\*Conn\) [Execute](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L458>)
+### func \(\*Conn\) [Execute](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L490>)
 
 ```go
 func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error)
@@ -387,7 +388,7 @@ A connection/protocol\-level failure \(as opposed to a per\-statement SQL\-level
 Only pessimistic transactions make sense here: a mid\-pipeline failure does not stop already\-written EXECUTEs from running \(each is an independent command to the server — it has no idea they're "one batch"\), so row locks must already be held as each statement runs, not deferred to commit, for "any failure → roll back everything" to stay correct. Optimistic transactions defer conflict detection to COMMIT \(prewrite\) time — a conflict there fails the whole transaction at once, with no way to attribute it back to the one statement that actually collided, which defeats the per\-statement Callback this package is built around. This package does not support optimistic transactions and has no plans to.
 
 <a name="Conn.ExecuteAutoCommit"></a>
-### func \(\*Conn\) [ExecuteAutoCommit](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L478>)
+### func \(\*Conn\) [ExecuteAutoCommit](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L510>)
 
 ```go
 func (c *Conn) ExecuteAutoCommit(ctx context.Context, b *Batch) (*ExecuteResult, error)
@@ -398,7 +399,7 @@ ExecuteAutoCommit pipelines every statement in b exactly like Execute — prepar
 This trades away the one thing Execute's BEGIN/COMMIT round trips buy — all\-or\-nothing atomicity across the batch — for two fewer round trips per call. It fits a read\-only batch, or one where a partial/failed write genuinely doesn't need undoing \(e.g. best\-effort logging\); anything that needs "every statement in this batch lands, or none do" must use Execute instead.
 
 <a name="Conn.Rollback"></a>
-### func \(\*Conn\) [Rollback](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L598>)
+### func \(\*Conn\) [Rollback](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L649>)
 
 ```go
 func (c *Conn) Rollback(ctx context.Context) error
@@ -406,8 +407,17 @@ func (c *Conn) Rollback(ctx context.Context) error
 
 Rollback sends ROLLBACK on c. Call this after Execute returns an ExecuteResult with AllSucceeded false and a nil error \(i.e. one of the batch's statements failed\), before reusing c for another Batch. It's unnecessary — though harmless — after ExecuteAutoCommit \(no transaction was ever opened\) or after a \*CommitError \(TiDB already rolled back server\-side when COMMIT was rejected\): either way there's nothing left to roll back, so Rollback is just a no\-op in those cases.
 
+<a name="Conn.SetStmtCacheLimit"></a>
+### func \(\*Conn\) [SetStmtCacheLimit](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/conn.go#L99>)
+
+```go
+func (c *Conn) SetStmtCacheLimit(n int)
+```
+
+SetStmtCacheLimit overrides c's prepared\-statement cache limit \(see defaultStmtCacheLimit\), e.g. to match a cluster's non\-default tidb\_session\_plan\_cache\_size. n \<= 0 disables eviction entirely \(the cache grows without bound, and this package never sends COM\_STMT\_CLOSE\). Call this before c's first Execute/ExecuteAutoCommit — it only affects evictions prepare\(\) performs afterward.
+
 <a name="DB"></a>
-## type [DB](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/db.go#L30-L43>)
+## type [DB](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/db.go#L31-L44>)
 
 DB is a pool of hijacked connections. Unlike Dial, which hands out one dedicated, single\-use connection per call, DB keeps a released Conn around in its own idle list \(see AcquireConn/release\) so a long\-running caller doesn't pay a fresh dial\+auth for every batch. The underlying \*sql.DB is used only as a dial/auth factory — a healthy Conn is never returned to \*that\* pool, since database/sql has no way to tell this package when it later hands such a connection back out, which is exactly the identity problem this design avoids.
 
@@ -418,7 +428,7 @@ type DB struct {
 ```
 
 <a name="Open"></a>
-### func [Open](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/db.go#L48>)
+### func [Open](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/db.go#L49>)
 
 ```go
 func Open(dsn string, maxConns int) (*DB, error)
@@ -427,7 +437,7 @@ func Open(dsn string, maxConns int) (*DB, error)
 Open opens dsn \(a standard go\-sql\-driver/mysql DSN\) and returns a DB that AcquireConn draws hijacked connections from, capped at maxConns concurrently live physical connections.
 
 <a name="DB.AcquireConn"></a>
-### func \(\*DB\) [AcquireConn](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/db.go#L105>)
+### func \(\*DB\) [AcquireConn](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/db.go#L106>)
 
 ```go
 func (db *DB) AcquireConn(ctx context.Context) (*Conn, error)
@@ -436,7 +446,7 @@ func (db *DB) AcquireConn(ctx context.Context) (*Conn, error)
 AcquireConn returns a hijacked Conn: an idle one from db's own pool if one is available, otherwise a freshly dialed \(and authenticated\) one if db is under maxConns, otherwise it blocks — respecting ctx — until either becomes true.
 
 <a name="DB.Close"></a>
-### func \(\*DB\) [Close](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/db.go#L209>)
+### func \(\*DB\) [Close](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/db.go#L212>)
 
 ```go
 func (db *DB) Close() error

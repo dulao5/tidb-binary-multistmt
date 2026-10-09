@@ -24,6 +24,7 @@
 package binarymultistmt
 
 import (
+	"container/list"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -35,6 +36,20 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 )
+
+// defaultStmtCacheLimit caps how many distinct prepared statements a Conn
+// keeps open before prepare() evicts the least-recently-used one (sending
+// COM_STMT_CLOSE for it — see prepare()). This package hijacks the whole
+// connection for its own exclusive use, so the session's server-side plan
+// cache (tidb_session_plan_cache_size, default 100 as of TiDB v8.5) holds
+// nothing but plans for statements this Conn itself prepared. Keeping the
+// client-side cache a bit smaller than that keeps this Conn's own LRU the
+// one deciding evictions, rather than occasionally racing TiDB's: if the
+// client thinks a statement is still cached but the server already evicted
+// its plan under memory/count pressure, EXECUTE still works (TiDB just
+// re-plans it), but silently pays for a plan rebuild this package thought
+// it had avoided.
+const defaultStmtCacheLimit = 90
 
 var dialSeq atomic.Uint64
 
@@ -49,12 +64,15 @@ func dialNetworkName() string {
 // pipelining after go-sql-driver/mysql establishes it. Not safe for
 // concurrent use — mirrors a single *sql.Conn's single-writer assumption.
 type Conn struct {
-	raw       net.Conn
-	db        *sql.DB // set only for a Dial-sourced Conn; see Close
-	pool      *DB     // set only for an AcquireConn-sourced Conn; see Close
-	broken    bool    // set on any connection/protocol-level failure — see execute.go
-	poolConn  *sql.Conn
-	stmtCache map[string]preparedStmt
+	raw      net.Conn
+	db       *sql.DB // set only for a Dial-sourced Conn; see Close
+	pool     *DB     // set only for an AcquireConn-sourced Conn; see Close
+	broken   bool    // set on any connection/protocol-level failure — see execute.go
+	poolConn *sql.Conn
+
+	stmtCacheLimit int                      // see defaultStmtCacheLimit; <= 0 means unlimited
+	stmtCache      map[string]*list.Element // sqlText -> its node in stmtLRU
+	stmtLRU        *list.List               // front = most recently used; Value is *stmtCacheEntry
 }
 
 type preparedStmt struct {
@@ -64,6 +82,22 @@ type preparedStmt struct {
 	// field (0 means no result set) — the server's ground truth, not a
 	// caller-supplied guess. See prepare().
 	hasResultSet bool
+}
+
+// stmtCacheEntry is one stmtLRU node's Value.
+type stmtCacheEntry struct {
+	sqlText string
+	stmt    preparedStmt
+}
+
+// SetStmtCacheLimit overrides c's prepared-statement cache limit (see
+// defaultStmtCacheLimit), e.g. to match a cluster's non-default
+// tidb_session_plan_cache_size. n <= 0 disables eviction entirely (the
+// cache grows without bound, and this package never sends COM_STMT_CLOSE).
+// Call this before c's first Execute/ExecuteAutoCommit — it only affects
+// evictions prepare() performs afterward.
+func (c *Conn) SetStmtCacheLimit(n int) {
+	c.stmtCacheLimit = n
 }
 
 // Dial opens dsn (a standard go-sql-driver/mysql DSN) via the driver's
@@ -112,10 +146,12 @@ func Dial(ctx context.Context, dsn string) (*Conn, error) {
 	nc.SetDeadline(time.Time{})
 
 	return &Conn{
-		raw:       nc,
-		db:        db,
-		poolConn:  pc,
-		stmtCache: make(map[string]preparedStmt),
+		raw:            nc,
+		db:             db,
+		poolConn:       pc,
+		stmtCacheLimit: defaultStmtCacheLimit,
+		stmtCache:      make(map[string]*list.Element),
+		stmtLRU:        list.New(),
 	}, nil
 }
 

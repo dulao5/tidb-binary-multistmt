@@ -141,9 +141,16 @@ type ExecuteResult struct {
 // the wire — the OK packet's own column-count field, authoritative per the
 // MySQL binary protocol (0 for a non-row-returning statement) — rather than
 // taken on faith from the caller.
+//
+// A newly prepared statement past c.stmtCacheLimit evicts the
+// least-recently-used entry, sending COM_STMT_CLOSE for it so the server's
+// own prepared-statement table (and the plan cache entry keyed off it)
+// doesn't grow unbounded right along with this Conn's lifetime — see
+// defaultStmtCacheLimit.
 func (c *Conn) prepare(sqlText string) (preparedStmt, error) {
-	if ps, ok := c.stmtCache[sqlText]; ok {
-		return ps, nil
+	if el, ok := c.stmtCache[sqlText]; ok {
+		c.stmtLRU.MoveToFront(el)
+		return el.Value.(*stmtCacheEntry).stmt, nil
 	}
 
 	if err := writePacket(c.raw, append([]byte{comStmtPrepare}, sqlText...)); err != nil {
@@ -191,8 +198,33 @@ func (c *Conn) prepare(sqlText string) (preparedStmt, error) {
 	}
 
 	ps := preparedStmt{id: id, paramCount: paramCount, hasResultSet: columnCount > 0}
-	c.stmtCache[sqlText] = ps
+	c.stmtCache[sqlText] = c.stmtLRU.PushFront(&stmtCacheEntry{sqlText: sqlText, stmt: ps})
+
+	if c.stmtCacheLimit > 0 {
+		for c.stmtLRU.Len() > c.stmtCacheLimit {
+			oldest := c.stmtLRU.Back()
+			c.stmtLRU.Remove(oldest)
+			evicted := oldest.Value.(*stmtCacheEntry)
+			delete(c.stmtCache, evicted.sqlText)
+			if err := writeComStmtClose(c.raw, evicted.stmt.id); err != nil {
+				c.broken = true
+				return preparedStmt{}, fmt.Errorf("evict cached statement for %q: %w", evicted.sqlText, err)
+			}
+		}
+	}
+
 	return ps, nil
+}
+
+// writeComStmtClose sends COM_STMT_CLOSE for stmtID. Per the MySQL binary
+// protocol this command gets no response at all — not even an OK packet —
+// so this is a fire-and-forget write; the caller must not try to read
+// anything back for it.
+func writeComStmtClose(w io.Writer, stmtID uint32) error {
+	var payload [5]byte
+	payload[0] = comStmtClose
+	binary.LittleEndian.PutUint32(payload[1:], stmtID)
+	return writePacket(w, payload[:])
 }
 
 // binTimeLayout is how time.Time args are sent: as a fieldString-typed
@@ -499,14 +531,17 @@ func (c *Conn) execute(ctx context.Context, b *Batch, explicitTxn bool) (*Execut
 		hasResultSet[i] = ps.hasResultSet
 	}
 
+	// BEGIN is written into the very same pipeline as the EXECUTEs below,
+	// not as its own separate write-then-wait round trip: once every
+	// statement is already prepared (the common case on a reused Conn —
+	// see stmtCacheLimit), this is the difference between two round trips
+	// for a batch and one. BEGIN's own response is read first, right before
+	// the per-statement read loop — see below — rather than synchronously
+	// here.
 	if explicitTxn {
 		if err := writeComQuery(c.raw, "BEGIN"); err != nil {
 			c.broken = true
 			return nil, fmt.Errorf("write BEGIN: %w", err)
-		}
-		if err := readOKorErr(c.raw); err != nil {
-			c.broken = true
-			return nil, fmt.Errorf("BEGIN failed: %w", err)
 		}
 	}
 
@@ -522,6 +557,22 @@ func (c *Conn) execute(ctx context.Context, b *Batch, explicitTxn bool) (*Execut
 		if err := writePacket(c.raw, payload); err != nil {
 			c.broken = true
 			return nil, fmt.Errorf("write exec #%d: %w", i, err)
+		}
+	}
+
+	if explicitTxn {
+		if err := readOKorErr(c.raw); err != nil {
+			// BEGIN itself was rejected. The N EXECUTEs already written right
+			// behind it in the same pipeline have already reached the server
+			// and been processed by now — each one outside of the explicit
+			// transaction this call promised its caller, under ordinary
+			// autocommit semantics instead. That's a different outcome than
+			// what Execute's contract describes, and there's no way to
+			// re-read and reconcile N already-applied, already-drained-past
+			// responses after the fact — so this is treated the same as any
+			// other protocol-level desync: discard c.
+			c.broken = true
+			return nil, fmt.Errorf("BEGIN failed: %w", err)
 		}
 	}
 

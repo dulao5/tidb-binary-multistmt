@@ -358,3 +358,97 @@ func TestIntegration_CommitRejectionKeepsConnReusable(t *testing.T) {
 		t.Fatalf("expected the post-conflict Execute to succeed, proving the Conn is genuinely reusable")
 	}
 }
+
+// TestIntegration_StmtCacheEvictionStillWorksAfterClose confirms against a
+// real server that a statement evicted from the client-side cache (and
+// COM_STMT_CLOSE'd on the wire for it) prepares and runs correctly the next
+// time its SQL text is used — i.e. eviction doesn't leave the connection's
+// prepared-statement bookkeeping, on either side, in a state that breaks a
+// later re-PREPARE of the same text.
+func TestIntegration_StmtCacheEvictionStillWorksAfterClose(t *testing.T) {
+	dsn := testDSN(t)
+	setupTable(t, dsn, "tbms_evict")
+
+	ctx := context.Background()
+	conn, err := Dial(ctx, dsn)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	conn.SetStmtCacheLimit(2)
+
+	insert := func(id int64) {
+		t.Helper()
+		b := NewBatch().Add("INSERT INTO tbms_evict (id, val) VALUES (?, ?)", []any{id, "v"}, nil)
+		res, err := conn.ExecuteAutoCommit(ctx, b)
+		if err != nil {
+			t.Fatalf("insert id=%d: %v", id, err)
+		}
+		if !res.AllSucceeded {
+			t.Fatalf("insert id=%d: statement failed", id)
+		}
+	}
+	count := func() {
+		t.Helper()
+		b := NewBatch().Add("SELECT COUNT(*) FROM tbms_evict", nil, func(sr *StatementResult) {
+			for row := sr.Rows.Next(); row != nil; row = sr.Rows.Next() {
+			}
+		})
+		if _, err := conn.ExecuteAutoCommit(ctx, b); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+	}
+
+	// Two distinct SQL texts fill the 2-slot cache; a third evicts "insert"
+	// (the least-recently-used one, since "count" ran after it); using
+	// "insert" again forces a cold re-PREPARE against the real server for a
+	// statement ID it was already told, via COM_STMT_CLOSE, to forget.
+	insert(1)
+	count()
+	count()
+	insert(2) // evicts "insert"'s original cache entry
+
+	if got, want := rowCount(t, dsn, "tbms_evict"), 2; got != want {
+		t.Fatalf("expected %d rows after eviction-and-reuse, got %d", want, got)
+	}
+}
+
+// TestIntegration_ExplicitTxnBeginPipelinedWithExecutes confirms, against a
+// real server, that pipelining BEGIN together with the batch's EXECUTEs
+// (rather than writing BEGIN and synchronously waiting for its own OK
+// before writing any EXECUTE) still produces a correct, committed
+// transaction — the optimization that cuts Execute from two round trips to
+// one when every statement is already prepared.
+func TestIntegration_ExplicitTxnBeginPipelinedWithExecutes(t *testing.T) {
+	dsn := testDSN(t)
+	setupTable(t, dsn, "tbms_begin_pipeline")
+
+	ctx := context.Background()
+	conn, err := Dial(ctx, dsn)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Warm the cache first so the real Execute call below hits the
+	// already-prepared path this optimization targets.
+	warm := NewBatch().Add("INSERT INTO tbms_begin_pipeline (id, val) VALUES (?, ?)", []any{int64(0), "warm"}, nil)
+	if _, err := conn.ExecuteAutoCommit(ctx, warm); err != nil {
+		t.Fatalf("warm up prepare: %v", err)
+	}
+
+	b := NewBatch()
+	for i := 1; i <= 5; i++ {
+		b.Add("INSERT INTO tbms_begin_pipeline (id, val) VALUES (?, ?)", []any{int64(i), fmt.Sprintf("v%d", i)}, nil)
+	}
+	res, err := conn.Execute(ctx, b)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !res.AllSucceeded {
+		t.Fatalf("expected all statements to succeed")
+	}
+	if got, want := rowCount(t, dsn, "tbms_begin_pipeline"), 6; got != want {
+		t.Fatalf("expected %d rows (1 warm-up + 5 batch) committed, got %d", want, got)
+	}
+}

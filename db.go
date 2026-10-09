@@ -1,6 +1,7 @@
 package binarymultistmt
 
 import (
+	"container/list"
 	"context"
 	"database/sql"
 	"fmt"
@@ -180,10 +181,12 @@ func (db *DB) dial(ctx context.Context) (*Conn, error) {
 	nc.SetDeadline(time.Time{})
 
 	return &Conn{
-		raw:       nc,
-		pool:      db,
-		poolConn:  pc,
-		stmtCache: make(map[string]preparedStmt),
+		raw:            nc,
+		pool:           db,
+		poolConn:       pc,
+		stmtCacheLimit: defaultStmtCacheLimit,
+		stmtCache:      make(map[string]*list.Element),
+		stmtLRU:        list.New(),
 	}, nil
 }
 
