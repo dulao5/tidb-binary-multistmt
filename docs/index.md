@@ -42,6 +42,7 @@ b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, func(sr *binarymult
 
 res, err := conn.Execute(ctx, b)
 var commitErr *binarymultistmt.CommitError
+var beginErr *binarymultistmt.BeginFailedError
 switch {
 case errors.As(err, &commitErr):
     // Every statement succeeded, but COMMIT itself was rejected (e.g. a
@@ -49,6 +50,15 @@ case errors.As(err, &commitErr):
     // still healthy and there's nothing to Rollback. Decide whether to
     // retry the whole batch.
     log.Println("commit rejected, already rolled back:", commitErr)
+case errors.As(err, &beginErr):
+    // BEGIN itself was rejected (vanishingly rare) — every statement
+    // already ran under autocommit instead of inside a transaction. conn
+    // is still healthy; beginErr.Error() already renders every
+    // statement's SQL, args, and outcome for your log. Even if every
+    // statement succeeded, each ran as its own independent autocommit
+    // transaction with its own start timestamp, not one shared snapshot —
+    // decide for yourself whether that matters for this batch.
+    log.Println(beginErr)
 case err != nil:
     // connection/protocol-level failure — conn is no longer usable, Close it
     conn.Close()
@@ -111,6 +121,17 @@ If every statement succeeds but the server then rejects `COMMIT` itself
 server-side when this happens), `Execute` returns a non-nil `*CommitError`
 instead — the connection is unaffected and stays usable, and there's
 nothing to roll back.
+
+If `BEGIN` itself is rejected (vanishingly rare), `Execute` returns a
+`*BeginFailedError` instead: every statement in the batch was already
+pipelined right behind `BEGIN` and already ran under autocommit by the
+time the rejection is read. The connection stays usable, and
+`BeginFailedError.Statements` reports each statement's real outcome — but
+even an all-succeeded batch isn't automatically equivalent to
+`ExecuteAutoCommit`, since each statement got its own autocommit start
+timestamp instead of sharing one transaction's snapshot. See the
+[repository README](https://github.com/dulao5/tidb-binary-multistmt#readme)
+for the full explanation.
 
 `ExecuteAutoCommit` pipelines the same way but never sends `BEGIN`/`COMMIT`
 — each statement commits on its own. There's nothing to roll back
@@ -185,6 +206,10 @@ See the package README for status, known limitations \(most notably: TLS is not 
   - [func \(b \*Batch\) Add\(sqlText string, args \[\]any, cb func\(\*StatementResult\)\) \*Batch](<#Batch.Add>)
   - [func \(b \*Batch\) Len\(\) int](<#Batch.Len>)
   - [func \(b \*Batch\) Statements\(\) \[\]Statement](<#Batch.Statements>)
+- [type BeginFailedError](<#BeginFailedError>)
+  - [func \(e \*BeginFailedError\) Error\(\) string](<#BeginFailedError.Error>)
+  - [func \(e \*BeginFailedError\) Unwrap\(\) error](<#BeginFailedError.Unwrap>)
+- [type BeginFailedStatement](<#BeginFailedStatement>)
 - [type Column](<#Column>)
 - [type CommitError](<#CommitError>)
   - [func \(e \*CommitError\) Error\(\) string](<#CommitError.Error>)
@@ -296,6 +321,57 @@ func (b *Batch) Statements() []Statement
 
 Statements returns a copy of the queued statements, in order.
 
+<a name="BeginFailedError"></a>
+## type [BeginFailedError](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L96-L100>)
+
+BeginFailedError reports that BEGIN itself was rejected by the server — vanishingly rare \(see Execute's doc comment on how BEGIN is pipelined\), but by the time the rejection is read, every statement in the batch has already been written right behind BEGIN in the same pipeline, so every one of them has already reached the server and been processed under ordinary autocommit, not inside the transaction Execute's caller asked for.
+
+Unlike a true in\-doubt/undetermined outcome \(e.g. a network failure during COMMIT, where the client genuinely cannot tell whether the server committed\), this is fully determined: the wire never desynced \(BEGIN's own ERR response was read cleanly, and every EXECUTE that follows it is still a well\-formed, independently readable response\), so this package reads every one of them before returning and reports each statement's actual outcome in Statements, in batch order. c itself stays usable — there was no protocol\-level failure, only a semantic one.
+
+This package reports every statement's outcome and leaves what to do about it entirely to the caller \(or whatever reads this from a log line, since Error\(\) renders every statement's SQL, args, and status\) — even when every Statements entry succeeded. That case is the closest to harmless, but it is not automatically equivalent to having called ExecuteAutoCommit: each statement ran as its own independent autocommit transaction with its own start timestamp, not sharing one snapshot the way statements inside a single BEGIN...COMMIT transaction would have. An application whose batch relied on every statement seeing the same consistent snapshot \(e.g. two SELECTs expected to agree with each other, or a later statement's logic implicitly depending on an earlier one's read not being concurrently modified in between\) may have gotten a materially different outcome than intended, even though nothing individually failed. When some statements succeeded and some failed, the batch's atomicity contract was violated outright, and there is no way for this package to roll back the ones that already landed under autocommit. Either way, deciding what — if anything — needs reconciling is an application\-level judgment call this package does not attempt to make for you.
+
+```go
+type BeginFailedError struct {
+    // Err is BEGIN's own rejection (typically a *SQLError).
+    Err        error
+    Statements []BeginFailedStatement
+}
+```
+
+<a name="BeginFailedError.Error"></a>
+### func \(\*BeginFailedError\) [Error](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L102>)
+
+```go
+func (e *BeginFailedError) Error() string
+```
+
+
+
+<a name="BeginFailedError.Unwrap"></a>
+### func \(\*BeginFailedError\) [Unwrap](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L115>)
+
+```go
+func (e *BeginFailedError) Unwrap() error
+```
+
+
+
+<a name="BeginFailedStatement"></a>
+## type [BeginFailedStatement](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L51-L58>)
+
+BeginFailedStatement is one batch statement's outcome as reported by a \*BeginFailedError — see that type's doc comment.
+
+```go
+type BeginFailedStatement struct {
+    Index int
+    SQL   string
+    Args  []any
+    // Err is nil if this statement succeeded (under autocommit), or its
+    // error (typically a *SQLError) if it failed.
+    Err error
+}
+```
+
 <a name="Column"></a>
 ## type [Column](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/resultset.go#L47-L52>)
 
@@ -311,7 +387,7 @@ type Column struct {
 ```
 
 <a name="CommitError"></a>
-## type [CommitError](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L39-L43>)
+## type [CommitError](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L40-L44>)
 
 CommitError reports that COMMIT itself was rejected by the server after every statement in the batch individually reported success — as opposed to one of the batch's statements failing \(that always surfaces as a \*SQLError delivered to that statement's own Callback instead\). This can happen even though this package only supports pessimistic transactions — e.g. a prewrite\-time write conflict, a concurrent schema change invalidating the transaction, or the GC lifetime being exceeded.
 
@@ -326,7 +402,7 @@ type CommitError struct {
 ```
 
 <a name="CommitError.Error"></a>
-### func \(\*CommitError\) [Error](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L45>)
+### func \(\*CommitError\) [Error](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L46>)
 
 ```go
 func (e *CommitError) Error() string
@@ -335,7 +411,7 @@ func (e *CommitError) Error() string
 
 
 <a name="CommitError.Unwrap"></a>
-### func \(\*CommitError\) [Unwrap](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L46>)
+### func \(\*CommitError\) [Unwrap](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L47>)
 
 ```go
 func (e *CommitError) Unwrap() error
@@ -373,7 +449,7 @@ func (c *Conn) Close() error
 Close releases c. For a Dial\-sourced Conn this destroys the connection and its dedicated factory \*sql.DB. For an AcquireConn\-sourced Conn, it instead returns c to its DB's own idle pool for reuse by a later AcquireConn call — unless c suffered a connection/protocol\-level failure \(see Execute/Rollback's doc comments\), in which case it is destroyed instead. Either way, c must not be used after Close.
 
 <a name="Conn.Execute"></a>
-### func \(\*Conn\) [Execute](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L490>)
+### func \(\*Conn\) [Execute](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L568>)
 
 ```go
 func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error)
@@ -385,10 +461,12 @@ If every statement succeeded but COMMIT itself is then rejected by the server, E
 
 A connection/protocol\-level failure \(as opposed to a per\-statement SQL\-level ERR or a \*CommitError\) returns a non\-nil error and leaves c unusable — the caller must Close it and Dial a new one.
 
+BEGIN is pipelined together with the batch's EXECUTEs \(see the package doc comment\); in the vanishingly rare case that BEGIN itself is rejected, Execute returns a non\-nil \*BeginFailedError \(check with errors.As\) — c stays usable \(the wire didn't desync, only the transaction never started\), and BeginFailedError.Statements reports every statement's real outcome, since each one already ran under autocommit instead of inside a transaction. See BeginFailedError's doc comment for how to tell an all\-succeeded \(nothing to repair\) outcome from a partially\-applied one.
+
 Only pessimistic transactions make sense here: a mid\-pipeline failure does not stop already\-written EXECUTEs from running \(each is an independent command to the server — it has no idea they're "one batch"\), so row locks must already be held as each statement runs, not deferred to commit, for "any failure → roll back everything" to stay correct. Optimistic transactions defer conflict detection to COMMIT \(prewrite\) time — a conflict there fails the whole transaction at once, with no way to attribute it back to the one statement that actually collided, which defeats the per\-statement Callback this package is built around. This package does not support optimistic transactions and has no plans to.
 
 <a name="Conn.ExecuteAutoCommit"></a>
-### func \(\*Conn\) [ExecuteAutoCommit](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L510>)
+### func \(\*Conn\) [ExecuteAutoCommit](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L588>)
 
 ```go
 func (c *Conn) ExecuteAutoCommit(ctx context.Context, b *Batch) (*ExecuteResult, error)
@@ -399,7 +477,7 @@ ExecuteAutoCommit pipelines every statement in b exactly like Execute — prepar
 This trades away the one thing Execute's BEGIN/COMMIT round trips buy — all\-or\-nothing atomicity across the batch — for two fewer round trips per call. It fits a read\-only batch, or one where a partial/failed write genuinely doesn't need undoing \(e.g. best\-effort logging\); anything that needs "every statement in this batch lands, or none do" must use Execute instead.
 
 <a name="Conn.Rollback"></a>
-### func \(\*Conn\) [Rollback](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L649>)
+### func \(\*Conn\) [Rollback](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L776>)
 
 ```go
 func (c *Conn) Rollback(ctx context.Context) error
@@ -455,7 +533,7 @@ func (db *DB) Close() error
 Close destroys every currently idle connection and closes the underlying dial/auth factory. A Conn already checked out via AcquireConn at the time of Close is unaffected until its own Close is called, at which point release notices db is closed and destroys it instead of re\-idling it.
 
 <a name="ExecuteResult"></a>
-## type [ExecuteResult](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L129-L136>)
+## type [ExecuteResult](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L198-L205>)
 
 ExecuteResult is what Conn.Execute returns.
 
@@ -471,7 +549,7 @@ type ExecuteResult struct {
 ```
 
 <a name="RowIterator"></a>
-## type [RowIterator](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L76-L82>)
+## type [RowIterator](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L145-L151>)
 
 RowIterator streams one row\-returning statement's rows directly off the wire, one at a time, instead of Conn.Execute buffering the whole result set up front. Only valid for the duration of the Callback call that receives it via StatementResult.Rows.
 
@@ -482,7 +560,7 @@ type RowIterator struct {
 ```
 
 <a name="RowIterator.Columns"></a>
-### func \(\*RowIterator\) [Columns](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L85>)
+### func \(\*RowIterator\) [Columns](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L154>)
 
 ```go
 func (it *RowIterator) Columns() []Column
@@ -491,7 +569,7 @@ func (it *RowIterator) Columns() []Column
 Columns returns this result set's column list.
 
 <a name="RowIterator.Err"></a>
-### func \(\*RowIterator\) [Err](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L126>)
+### func \(\*RowIterator\) [Err](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L195>)
 
 ```go
 func (it *RowIterator) Err() error
@@ -500,7 +578,7 @@ func (it *RowIterator) Err() error
 Err reports the error that stopped iteration, or nil if Next returned nil because the result set was exhausted normally.
 
 <a name="RowIterator.Next"></a>
-### func \(\*RowIterator\) [Next](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L90>)
+### func \(\*RowIterator\) [Next](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L159>)
 
 ```go
 func (it *RowIterator) Next() []any
@@ -509,7 +587,7 @@ func (it *RowIterator) Next() []any
 Next decodes and returns the next row \(one value per Columns\(\), nil for SQL NULL\), or nil when there are no more rows — call Err afterward to tell a clean end\-of\-result\-set apart from a failure partway through.
 
 <a name="SQLError"></a>
-## type [SQLError](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L18-L20>)
+## type [SQLError](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L19-L21>)
 
 SQLError distinguishes a server\-reported SQL\-level failure \(an ERR packet for one statement — Execute keeps draining the rest of the batch's responses\) from a connection/protocol\-level failure \(Execute aborts immediately and the Conn must be discarded\).
 
@@ -520,7 +598,7 @@ type SQLError struct {
 ```
 
 <a name="SQLError.Error"></a>
-### func \(\*SQLError\) [Error](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L22>)
+### func \(\*SQLError\) [Error](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L23>)
 
 ```go
 func (e *SQLError) Error() string
@@ -561,7 +639,7 @@ type Statement struct {
 ```
 
 <a name="StatementResult"></a>
-## type [StatementResult](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L52-L70>)
+## type [StatementResult](<https://github.com/dulao5/tidb-binary-multistmt/blob/main/execute.go#L121-L139>)
 
 StatementResult is one Batch statement's outcome, delivered to its Callback — see Statement.Callback. There is no other way to read a statement's result: Conn.Execute keeps no per\-statement record after the batch finishes, on purpose, so there's exactly one place to look.
 

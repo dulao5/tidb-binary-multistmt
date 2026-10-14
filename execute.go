@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,74 @@ type CommitError struct {
 
 func (e *CommitError) Error() string { return fmt.Sprintf("commit failed: %v", e.Err) }
 func (e *CommitError) Unwrap() error { return e.Err }
+
+// BeginFailedStatement is one batch statement's outcome as reported by a
+// *BeginFailedError — see that type's doc comment.
+type BeginFailedStatement struct {
+	Index int
+	SQL   string
+	Args  []any
+	// Err is nil if this statement succeeded (under autocommit), or its
+	// error (typically a *SQLError) if it failed.
+	Err error
+}
+
+// BeginFailedError reports that BEGIN itself was rejected by the server —
+// vanishingly rare (see Execute's doc comment on how BEGIN is pipelined),
+// but by the time the rejection is read, every statement in the batch has
+// already been written right behind BEGIN in the same pipeline, so every
+// one of them has already reached the server and been processed under
+// ordinary autocommit, not inside the transaction Execute's caller asked
+// for.
+//
+// Unlike a true in-doubt/undetermined outcome (e.g. a network failure
+// during COMMIT, where the client genuinely cannot tell whether the server
+// committed), this is fully determined: the wire never desynced (BEGIN's
+// own ERR response was read cleanly, and every EXECUTE that follows it is
+// still a well-formed, independently readable response), so this package
+// reads every one of them before returning and reports each statement's
+// actual outcome in Statements, in batch order. c itself stays usable —
+// there was no protocol-level failure, only a semantic one.
+//
+// This package reports every statement's outcome and leaves what to do
+// about it entirely to the caller (or whatever reads this from a log line,
+// since Error() renders every statement's SQL, args, and status) — even
+// when every Statements entry succeeded. That case is the closest to
+// harmless, but it is not automatically equivalent to having called
+// ExecuteAutoCommit: each statement ran as its own independent autocommit
+// transaction with its own start timestamp, not sharing one snapshot the
+// way statements inside a single BEGIN...COMMIT transaction would have.
+// An application whose batch relied on every statement seeing the same
+// consistent snapshot (e.g. two SELECTs expected to agree with each other,
+// or a later statement's logic implicitly depending on an earlier one's
+// read not being concurrently modified in between) may have gotten a
+// materially different outcome than intended, even though nothing
+// individually failed. When some statements succeeded and some failed, the
+// batch's atomicity contract was violated outright, and there is no way
+// for this package to roll back the ones that already landed under
+// autocommit. Either way, deciding what — if anything — needs reconciling
+// is an application-level judgment call this package does not attempt to
+// make for you.
+type BeginFailedError struct {
+	// Err is BEGIN's own rejection (typically a *SQLError).
+	Err        error
+	Statements []BeginFailedStatement
+}
+
+func (e *BeginFailedError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "BEGIN failed: %v; %d statement(s) already ran outside a transaction (autocommit) because they were already pipelined behind BEGIN", e.Err, len(e.Statements))
+	for _, s := range e.Statements {
+		status := "OK"
+		if s.Err != nil {
+			status = fmt.Sprintf("ERROR: %v", s.Err)
+		}
+		fmt.Fprintf(&b, "; #%d %s args=%v: %s", s.Index, s.SQL, s.Args, status)
+	}
+	return b.String()
+}
+
+func (e *BeginFailedError) Unwrap() error { return e.Err }
 
 // StatementResult is one Batch statement's outcome, delivered to its
 // Callback — see Statement.Callback. There is no other way to read a
@@ -477,6 +546,15 @@ func readOKorErr(raw io.Reader) error {
 // SQL-level ERR or a *CommitError) returns a non-nil error and leaves c
 // unusable — the caller must Close it and Dial a new one.
 //
+// BEGIN is pipelined together with the batch's EXECUTEs (see the package
+// doc comment); in the vanishingly rare case that BEGIN itself is rejected,
+// Execute returns a non-nil *BeginFailedError (check with errors.As) — c
+// stays usable (the wire didn't desync, only the transaction never
+// started), and BeginFailedError.Statements reports every statement's real
+// outcome, since each one already ran under autocommit instead of inside a
+// transaction. See BeginFailedError's doc comment for how to tell an
+// all-succeeded (nothing to repair) outcome from a partially-applied one.
+//
 // Only pessimistic transactions make sense here: a mid-pipeline failure
 // does not stop already-written EXECUTEs from running (each is an
 // independent command to the server — it has no idea they're "one batch"),
@@ -509,6 +587,59 @@ func (c *Conn) Execute(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 // instead.
 func (c *Conn) ExecuteAutoCommit(ctx context.Context, b *Batch) (*ExecuteResult, error) {
 	return c.execute(ctx, b, false)
+}
+
+// readStatementResponses reads stmts' pipelined EXECUTE responses off c.raw,
+// in order, invoking each statement's Callback exactly once regardless of
+// which path produced its outcome (see Statement.Callback) — shared between
+// execute's normal (BEGIN succeeded or no explicit transaction) path and its
+// *BeginFailedError path, since reading N already-written EXECUTE responses
+// is identical either way.
+//
+// Returns one error per statement (nil for success, typically a *SQLError
+// otherwise) and, separately, the first connection/protocol-level failure
+// encountered (nil if none). A non-nil protoErr means the wire can no
+// longer be trusted from that point on — the caller must mark c broken and
+// must not treat any statement at or after the failing index as read; a
+// non-nil protoErr always comes with a nil stmtErrs slice for exactly this
+// reason (don't hand back partial results that look complete).
+func (c *Conn) readStatementResponses(stmts []Statement, hasResultSet []bool) (stmtErrs []error, protoErr error) {
+	stmtErrs = make([]error, len(stmts))
+	for i, s := range stmts {
+		hrs := hasResultSet[i]
+
+		// calledViaStream tracks whether cb below actually ran (it may not:
+		// a statement that fails outright — e.g. an ERR packet instead of a
+		// result-set header — never reaches the streaming branch inside
+		// drainExecuteResponse). Only when it didn't run do we invoke
+		// s.Callback ourselves afterward, so it fires exactly once either
+		// way.
+		calledViaStream := false
+		var cb func(*RowIterator)
+		if s.Callback != nil && hrs {
+			cb = func(it *RowIterator) {
+				calledViaStream = true
+				sr := StatementResult{Index: i, SQL: s.SQL, HasResultSet: true, Rows: it}
+				s.Callback(&sr)
+			}
+		}
+
+		err := drainExecuteResponse(c.raw, hrs, cb)
+		if s.Callback != nil && !calledViaStream {
+			sr := StatementResult{Index: i, SQL: s.SQL, HasResultSet: hrs, Err: err}
+			s.Callback(&sr)
+		}
+		if err != nil {
+			var sqlErr *SQLError
+			if !errors.As(err, &sqlErr) {
+				// Connection/protocol-level failure: we can no longer trust
+				// response-stream alignment for the remaining statements.
+				return nil, fmt.Errorf("reading response #%d: %w", i, err)
+			}
+			stmtErrs[i] = err
+		}
+	}
+	return stmtErrs, nil
 }
 
 // execute is Execute and ExecuteAutoCommit's shared implementation;
@@ -562,56 +693,52 @@ func (c *Conn) execute(ctx context.Context, b *Batch, explicitTxn bool) (*Execut
 
 	if explicitTxn {
 		if err := readOKorErr(c.raw); err != nil {
-			// BEGIN itself was rejected. The N EXECUTEs already written right
-			// behind it in the same pipeline have already reached the server
-			// and been processed by now — each one outside of the explicit
-			// transaction this call promised its caller, under ordinary
-			// autocommit semantics instead. That's a different outcome than
-			// what Execute's contract describes, and there's no way to
-			// re-read and reconcile N already-applied, already-drained-past
-			// responses after the fact — so this is treated the same as any
-			// other protocol-level desync: discard c.
-			c.broken = true
-			return nil, fmt.Errorf("BEGIN failed: %w", err)
+			var sqlErr *SQLError
+			if !errors.As(err, &sqlErr) {
+				// A genuine protocol-level failure reading BEGIN's own
+				// response (not an ERR packet — a read error, a malformed
+				// packet) desyncs the wire before we ever get to the
+				// EXECUTEs' responses. Nothing past this point is readable.
+				c.broken = true
+				return nil, fmt.Errorf("BEGIN failed: %w", err)
+			}
+			// BEGIN was cleanly rejected (an ERR packet) — the wire itself
+			// did not desync. The N EXECUTEs already written right behind
+			// it in the same pipeline have already reached the server and
+			// been processed under ordinary autocommit instead of the
+			// transaction this call promised — but their responses are
+			// still well-formed and still readable in order, exactly like
+			// the normal path below. Read them for real, so
+			// *BeginFailedError can report every statement's actual
+			// outcome instead of discarding a connection that's still
+			// perfectly usable.
+			stmtErrs, protoErr := c.readStatementResponses(stmts, hasResultSet)
+			if protoErr != nil {
+				c.broken = true
+				return nil, protoErr
+			}
+			allSucceeded := true
+			failed := make([]BeginFailedStatement, len(stmts))
+			for i, s := range stmts {
+				failed[i] = BeginFailedStatement{Index: i, SQL: s.SQL, Args: s.Args, Err: stmtErrs[i]}
+				if stmtErrs[i] != nil {
+					allSucceeded = false
+				}
+			}
+			return &ExecuteResult{AllSucceeded: allSucceeded}, &BeginFailedError{Err: sqlErr, Statements: failed}
 		}
 	}
 
+	stmtErrs, protoErr := c.readStatementResponses(stmts, hasResultSet)
+	if protoErr != nil {
+		c.broken = true
+		return nil, protoErr
+	}
 	allOK := true
-	for i, s := range stmts {
-		hrs := hasResultSet[i]
-
-		// calledViaStream tracks whether cb below actually ran (it may not:
-		// a statement that fails outright — e.g. an ERR packet instead of a
-		// result-set header — never reaches the streaming branch inside
-		// drainExecuteResponse). Only when it didn't run do we invoke
-		// s.Callback ourselves afterward, so it fires exactly once either
-		// way.
-		calledViaStream := false
-		var cb func(*RowIterator)
-		if s.Callback != nil && hrs {
-			cb = func(it *RowIterator) {
-				calledViaStream = true
-				sr := StatementResult{Index: i, SQL: s.SQL, HasResultSet: true, Rows: it}
-				s.Callback(&sr)
-			}
-		}
-
-		err := drainExecuteResponse(c.raw, hrs, cb)
-		if s.Callback != nil && !calledViaStream {
-			sr := StatementResult{Index: i, SQL: s.SQL, HasResultSet: hrs, Err: err}
-			s.Callback(&sr)
-		}
-		if err != nil {
-			var sqlErr *SQLError
-			if !errors.As(err, &sqlErr) {
-				// Connection/protocol-level failure: we can no longer trust
-				// response-stream alignment for the remaining statements,
-				// and sending COMMIT/ROLLBACK on a connection in this state
-				// is unsafe. Abort.
-				c.broken = true
-				return nil, fmt.Errorf("reading response #%d: %w", i, err)
-			}
+	for _, e := range stmtErrs {
+		if e != nil {
 			allOK = false
+			break
 		}
 	}
 

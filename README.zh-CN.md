@@ -59,12 +59,21 @@ b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, func(sr *binarymult
 
 res, err := conn.Execute(ctx, b)
 var commitErr *binarymultistmt.CommitError
+var beginErr *binarymultistmt.BeginFailedError
 switch {
 case errors.As(err, &commitErr):
     // 每条语句都成功了，但 COMMIT 本身被服务端拒绝了（比如写冲突）——
     // TiDB 已经在服务端自动回滚了，conn 仍然健康，没有什么需要 Rollback
     // 的。接下来自己决定要不要重试整个 batch。
     log.Println("commit rejected, already rolled back:", commitErr)
+case errors.As(err, &beginErr):
+    // BEGIN 本身被拒绝了（极罕见）——batch 里每条语句都已经在
+    // autocommit 下跑完了，不是跑在事务里。conn 仍然健康；
+    // beginErr.Error() 已经把每条语句的 SQL、参数、结果都渲染好了，
+    // 可以直接扔进日志。即使每条语句都成功了，每条语句各自是独立的
+    // autocommit 事务、各自有自己的 start timestamp，不是共享同一个
+    // snapshot——这对这批 batch 是否有影响，自己判断。
+    log.Println(beginErr)
 case err != nil:
     // 连接/协议层的失败——conn 已经不能再用了，Close 掉
     conn.Close()
@@ -96,6 +105,15 @@ default:
 - 如果每条语句都成功了，但服务端随后拒绝了 `COMMIT` 本身（比如写冲突），`Execute`
   会返回一个 `*CommitError`（用 `errors.As` 判断）。这种情况下 TiDB
   已经在服务端自动回滚了——`conn` 照样健康能用，也没有什么需要回滚的。
+- 如果 `BEGIN` 本身被拒绝了（极罕见），`Execute` 会返回一个
+  `*BeginFailedError`。等到读到这个拒绝的时候，batch 里每条语句都已经紧跟在
+  `BEGIN` 后面一起 pipeline 发出去、并且已经在 autocommit 下跑完了——`conn`
+  仍然健康（wire 没有错位，只是事务没真正开起来），`BeginFailedError.Statements`
+  会把每条语句的真实结果（`Index`/`SQL`/`Args`/`Err`）报给你——**不是**本库替你下结论。即使每条语句都成功了，这也**不**等同于用了
+  `ExecuteAutoCommit`：每条语句各自是独立的 autocommit 事务、各自拿自己的
+  start timestamp，不像同一个 `BEGIN...COMMIT`
+  里那样共享一份快照——如果你的 batch 依赖"所有语句看到同一份一致数据"，哪怕每条语句单独看都没失败，这个保证也已经没有了。如果有的成功有的失败，batch
+  的原子性约定就彻底被打破了，本库没法把已经在 autocommit 下落盘的语句回滚回去。不管哪种情况，要不要修复、怎么修复，都是你自己的判断。
 - 只支持悲观事务。pipeline 中途一旦有语句失败，并不会阻止已经写出去的那些
   `EXECUTE` 继续被执行（服务端根本不知道这些是"一个 batch"），所以行锁必须在每条语句执行时就已经拿到，不能推迟到
   `COMMIT`，"只要失败就整体回滚"才站得住。乐观事务把冲突检测推迟到
@@ -260,10 +278,80 @@ PREPARE 缓存用的 key），所以如果某个调用点的列表长度经常�
 MySQL 的命令包都自带长度前缀、自分隔——协议本身并不要求命令之间必须有一次往返。`database/sql`
 只是没有暴露"先写后读"这种 API。
 
-`BEGIN`（一条 `COM_QUERY`）跟它后面 pipeline 的 `COM_STMT_EXECUTE`
-适用的是同一个道理：`Execute` 会把 `BEGIN` 和 batch 里每条语句的
+### 本库依赖的两条协议事实
+
+下面这些都来自协议本身早就告诉你的两件事——本库只是去读它们，而不是要求调用方自己声明（关于本库依赖的协议版本假设，见[已知限制](#已知限制)）。
+
+**1. `COM_STMT_PREPARE` 自己的响应就说明了一条语句会不会返回结果集**——不用猜，也不用调用方传一个flag（下面这张字节布局图保留英文字段名，跟README.md逐字节一致，方便跟协议文档/抓包对照）：
+
+```
+COM_STMT_PREPARE_OK (the first packet of a successful PREPARE response)
+
+ byte:    0        1  2  3  4     5  6         7  8         9  10
+         ┌────────┬──────────────┬───────────┬───────────┬────────┐
+         │  0x00  │ statement id │  column   │ parameter │ filler │
+         │  (OK)  │  (4 bytes)   │   count   │   count   │(2 byte)│
+         └────────┴──────────────┴─────┬─────┴───────────┴────────┘
+                                        │
+                        column_count > 0  →  this statement returns rows
+                        column_count == 0 →  this statement does not
+```
+
+本库只在一条语句第一次PREPARE的时候读一次这个`column_count`字段，记下来——之后每个`StatementResult`上的`HasResultSet`就是这个字段，不是调用方声明的（早期版本是让调用方传一个`hasResultSet bool`参数；写反了一次就能把整条连接打乱——具体见commit历史，这个参数早就去掉了）。
+
+**2. 一条命令的响应，它的"第一个字节"本身就告诉你该怎么解析剩下的部分**——这正是"把不同种类的命令pipeline在一起"也安全的原因，不只是"把N个相同的命令pipeline在一起"安全而已：
+
+```
+ EXECUTE（或者BEGIN/COMMIT/ROLLBACK）响应的第一个字节：
+
+   0x00  →  OK包           没有行；这条语句/命令成功了
+   0xFF  →  ERR包          被拒绝了——但wire本身的往返是正常的，
+                           继续读这个batch剩下的响应
+   其他情况
+         →  这是一个变长整数的第一个字节：结果集的列数。
+            只有COM_STMT_PREPARE已经告诉过我们HasResultSet=true的语句
+            才可能走到这个分支。后面跟着的是列定义包、一个EOF，再往后
+            才是真正的行数据。
+```
+
+正因为每个响应都是这样自描述的，读取方完全不需要"提前被告知'第3条语句会返回结果集'"——它是在真正读到第3条语句自己的响应时，从第一个字节里实时得知的。
+
+### `BEGIN` 也被 pipeline 了，不只是 `EXECUTE`
+
+`Execute` 会把 `BEGIN` 和 batch 里每条语句的
 `EXECUTE` 连续写完，再按顺序依次读 `BEGIN` 的响应和每条 `EXECUTE`
-的响应——而不是先等 `BEGIN` 自己的 OK 回来才去写别的。本库早期版本里"要多花两次往返"说的就是后面这种写法。
+的响应——而不是先等 `BEGIN` 自己的 OK 回来才去写别的。本库早期版本里"要多花两次往返"说的就是后面这种写法。只要每条语句都已经PREPARE过（复用一条连接时的常见情况），下面这组"全写完再全读完"的交换只要一次往返，加上`COMMIT`自己再一次往返：
+
+```mermaid
+sequenceDiagram
+    participant App as 客户端（本库）
+    participant Srv as TiDB / MySQL 服务端
+
+    Note over App,Srv: 这条连接上每条语句都已经 PREPARE 过了（最常见的情况）
+
+    rect rgb(230, 240, 255)
+        Note right of App: 只写阶段——下面的写操作全部发到 wire 上之前，不读任何东西
+        App->>Srv: COM_QUERY "BEGIN"
+        App->>Srv: COM_STMT_EXECUTE（语句 1）
+        App->>Srv: COM_STMT_EXECUTE（语句 2）
+    end
+
+    Note over Srv: 服务端严格按收到的顺序读取并处理命令，每处理完一条就写一条响应——<br/>它从不会等客户端先读完上一个响应，才肯接收下一条命令。
+
+    rect rgb(255, 245, 230)
+        Note right of Srv: 只读阶段——响应到达并被读取的顺序，跟命令发出的顺序完全一致。<br/>一条会返回结果集的语句，它的响应里也带着这些行。
+        Srv-->>App: OK（BEGIN）
+        Srv-->>App: 语句 1 的响应（OK/ERR）
+        Srv-->>App: 语句 2 的响应（OK/ERR）
+    end
+
+    Note over App: 全部语句都成功了，于是发 COMMIT（它自己单独一次往返，<br/>因为发不发全看上面每条 EXECUTE 的结果）
+
+    App->>Srv: COM_QUERY "COMMIT"
+    Srv-->>App: OK（COMMIT）
+```
+
+这张图简化了两件事，别处讲得更细：一条在这条连接上从没出现过的SQL文本，需要在上面这组pipeline交换之前自己单独走一次`COM_STMT_PREPARE`往返（这是同步的——下一条EXECUTE需要PREPARE返回的语句id）；如果`BEGIN`自己被拒绝了（极罕见），等发现的时候它后面的EXECUTE早就已经在autocommit下跑完了——见上文的`*BeginFailedError`。
 
 本库没有去 fork go-sql-driver/mysql 绕开这个限制，而是通过驱动自己公开的
 [`mysql.RegisterDialContext`](https://github.com/go-sql-driver/mysql)
@@ -290,6 +378,9 @@ MySQL 的命令包都自带长度前缀、自分隔——协议本身并不要�
 - `BEGIN` 跟 batch 里的 `EXECUTE` 一起 pipeline 发出去（而不是单独写完同步等一次）照样能正确提交事务
 - 从 `SetStmtCacheLimit` 的 LRU 缓存里被淘汰（并被 `COM_STMT_CLOSE`
   掉）的语句，下次在同一个 `Conn` 上复用同样的 SQL 文本时，能正常重新 prepare 并执行
+
+`*BeginFailedError` **不在**上面这份列表里——真实让 TiDB 拒绝一个`BEGIN`没有实际可行的办法（这正是它极罕见的原因）。这部分是在协议层面、用脚本化的假 server 验证的：每一条已经 pipeline 发出去的语句，响应照样能正确读出并汇报，每条语句的
+`Callback` 照样恰好触发一次，`conn` 结束后仍然可用。
 
 每一个解析 wire 上字节的入口（`readPacket`、`decodeColumnDef`、`decodeBinaryRow`、`drainExecuteResponse`、`readOKorErr`）都配有一个
 Go 原生 fuzz target（`fuzz_test.go`）——CI 每次 push 都会短暂跑一下，完整语料库（包括过去发现过的崩溃用例）每次

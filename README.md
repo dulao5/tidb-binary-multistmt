@@ -68,6 +68,7 @@ b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, func(sr *binarymult
 
 res, err := conn.Execute(ctx, b)
 var commitErr *binarymultistmt.CommitError
+var beginErr *binarymultistmt.BeginFailedError
 switch {
 case errors.As(err, &commitErr):
     // Every statement succeeded, but COMMIT itself was rejected (e.g. a
@@ -75,6 +76,15 @@ case errors.As(err, &commitErr):
     // still healthy and there's nothing to Rollback. Decide whether to
     // retry the whole batch.
     log.Println("commit rejected, already rolled back:", commitErr)
+case errors.As(err, &beginErr):
+    // BEGIN itself was rejected (vanishingly rare) — every statement
+    // already ran under autocommit instead of inside a transaction. conn
+    // is still healthy; beginErr.Error() already renders every
+    // statement's SQL, args, and outcome for your log. Even if every
+    // statement succeeded, each ran as its own independent autocommit
+    // transaction with its own start timestamp, not one shared snapshot —
+    // decide for yourself whether that matters for this batch.
+    log.Println(beginErr)
 case err != nil:
     // connection/protocol-level failure — conn is no longer usable, Close it
     conn.Close()
@@ -110,6 +120,23 @@ A few things to know:
   (e.g. a write conflict), `Execute` returns a `*CommitError` (check with
   `errors.As`). TiDB has already rolled back server-side when this
   happens — `conn` stays healthy, and there's nothing to roll back.
+- If `BEGIN` itself is rejected (vanishingly rare), `Execute` returns a
+  `*BeginFailedError` instead. By the time that rejection is read, every
+  statement in the batch was already pipelined right behind `BEGIN` and has
+  already run under autocommit — `conn` stays healthy (the wire didn't
+  desync, only the transaction never started), and
+  `BeginFailedError.Statements` reports each statement's real outcome
+  (`Index`/`SQL`/`Args`/`Err`) so you — not this package — can decide what
+  to do. Even if every statement succeeded, this is **not** automatically
+  the same as having used `ExecuteAutoCommit`: each statement ran as its
+  own independent autocommit transaction with its own start timestamp,
+  not sharing one snapshot the way statements inside a single
+  `BEGIN...COMMIT` would have — if your batch depended on every statement
+  seeing the same consistent view of the data, that guarantee is gone even
+  though nothing individually failed. If some statements succeeded and
+  some failed, the batch's atomicity contract was violated outright, and
+  this package cannot roll back the ones that already committed under
+  autocommit. Either way, reconciling is your call to make.
 - Only pessimistic transactions work here. A statement that fails
   mid-pipeline doesn't stop the `EXECUTE`s already written from running (the
   server has no idea they're "one batch"), so row locks must already be
@@ -301,12 +328,106 @@ MySQL command packets are self-delimited — nothing in the protocol
 requires a round trip between commands. `database/sql` just doesn't expose
 an API to write ahead of reading.
 
-This applies just as much to `BEGIN` (a `COM_QUERY`) as to a `COM_STMT_EXECUTE`
-pipelined behind it: `Execute` writes `BEGIN` and every statement's `EXECUTE`
-in one unbroken sequence, then reads `BEGIN`'s response followed by each
-`EXECUTE`'s in order — rather than waiting for `BEGIN`'s own OK before
-writing anything else, which is where the "two round trips" in older
-versions of this package came from.
+### Two protocol facts this package leans on
+
+Everything below follows from two things the wire protocol already tells
+you — this package just reads them, instead of asking the caller to
+declare them (see [Known limitations](#known-limitations) for the
+protocol-version assumptions this relies on).
+
+**1. `COM_STMT_PREPARE`'s own response says whether a statement returns
+rows** — no guessing, no caller-supplied flag:
+
+```
+COM_STMT_PREPARE_OK (the first packet of a successful PREPARE response)
+
+ byte:    0        1  2  3  4     5  6         7  8         9  10
+         ┌────────┬──────────────┬───────────┬───────────┬────────┐
+         │  0x00  │ statement id │  column   │ parameter │ filler │
+         │  (OK)  │  (4 bytes)   │   count   │   count   │(2 byte)│
+         └────────┴──────────────┴─────┬─────┴───────────┴────────┘
+                                        │
+                        column_count > 0  →  this statement returns rows
+                        column_count == 0 →  this statement does not
+```
+
+This package reads `column_count` once, when a statement is first
+PREPAREd, and remembers it — `HasResultSet` on every later
+`StatementResult` is this field, not something the caller declares (an
+earlier version of this package took a caller-supplied `hasResultSet bool`
+instead; getting it backward for one call desynced the whole connection —
+see the commit history for why that parameter is gone).
+
+**2. The first byte of the packet that follows a command tells you exactly
+how to parse the rest of it** — which is what makes pipelining multiple
+different command types together safe, not just pipelining N identical
+ones:
+
+```
+ first byte of the response to an EXECUTE (or to BEGIN/COMMIT/ROLLBACK):
+
+   0x00  →  OK packet       no rows; the statement/command succeeded
+   0xFF  →  ERR packet      rejected — but the wire itself round-tripped
+                             fine; keep reading the rest of the batch
+   anything else
+         →  the first byte of a length-encoded integer: the result set's
+            column count. Only possible for a statement COM_STMT_PREPARE
+            already told us HasResultSet=true for. Column-definition
+            packets, an EOF, and the rows themselves follow, in that order.
+```
+
+Because every response is self-describing this way, a reader never needs
+to have been told in advance "statement #3 will return rows" — it finds
+out from the first byte of statement #3's own response, in real time, as
+it arrives.
+
+### `BEGIN` is pipelined too, not just the `EXECUTE`s
+
+`Execute` writes `BEGIN` and every statement's `EXECUTE` in one unbroken
+sequence, then reads `BEGIN`'s response followed by each `EXECUTE`'s in
+order — rather than waiting for `BEGIN`'s own OK before writing anything
+else, which is where the "two round trips" in older versions of this
+package came from. Once every statement is already PREPAREd (the common
+case on a reused `Conn`), a whole batch costs exactly one round trip for
+the write-everything/read-everything exchange below, plus one more for
+`COMMIT`:
+
+```mermaid
+sequenceDiagram
+    participant App as Client (this package)
+    participant Srv as TiDB / MySQL server
+
+    Note over App,Srv: Every statement is already PREPAREd on this connection (the common case)
+
+    rect rgb(230, 240, 255)
+        Note right of App: Write phase — nothing is read until every write below is on the wire
+        App->>Srv: COM_QUERY "BEGIN"
+        App->>Srv: COM_STMT_EXECUTE (stmt 1)
+        App->>Srv: COM_STMT_EXECUTE (stmt 2)
+    end
+
+    Note over Srv: Server reads and dispatches commands strictly in receipt order, writing<br/>one response per command as it finishes — it never waits for the client<br/>to read a response before accepting the next command.
+
+    rect rgb(255, 245, 230)
+        Note right of Srv: Read phase — responses arrive, and are read, in the same order the<br/>commands were sent. A row-returning statement's response also carries its rows.
+        Srv-->>App: OK (BEGIN)
+        Srv-->>App: response to stmt 1 (OK/ERR)
+        Srv-->>App: response to stmt 2 (OK/ERR)
+    end
+
+    Note over App: Every statement succeeded, so send COMMIT (its own round trip, since<br/>whether to send it at all depends on how every EXECUTE above turned out)
+
+    App->>Srv: COM_QUERY "COMMIT"
+    Srv-->>App: OK (COMMIT)
+```
+
+Two things this diagram simplifies, each covered in more depth elsewhere:
+a statement whose SQL text hasn't been seen on this connection before
+needs its own `COM_STMT_PREPARE` round trip *before* the pipelined
+exchange above (each one is synchronous — the next EXECUTE needs the
+statement ID PREPARE returns); and if `BEGIN` itself comes back as an ERR
+(vanishingly rare), the EXECUTEs behind it have already run under
+autocommit by the time that's discovered — see `*BeginFailedError` above.
 
 This package doesn't fork go-sql-driver/mysql to get around that. It
 registers a custom dial function via the driver's own public
@@ -349,6 +470,14 @@ against a real TiDB (v8.5.8):
 - a statement evicted from `SetStmtCacheLimit`'s LRU cache (and
   `COM_STMT_CLOSE`'d for it) prepares and runs correctly the next time its
   SQL text is reused on the same `Conn`
+
+`*BeginFailedError` is **not** on the list above — genuinely triggering a
+server-rejected `BEGIN` against a live TiDB isn't practical (that's exactly
+why it's vanishingly rare in the first place). It's verified at the
+protocol level instead, against a scripted fake server: every already-
+pipelined statement's response is still read and reported correctly, every
+statement's `Callback` still fires exactly once, and `conn` is left usable
+afterward.
 
 Every entry point that parses bytes off the wire (`readPacket`,
 `decodeColumnDef`, `decodeBinaryRow`, `drainExecuteResponse`,

@@ -40,6 +40,7 @@ b.Add("SELECT balance FROM accounts WHERE id = ?", []any{1}, func(sr *binarymult
 
 res, err := conn.Execute(ctx, b)
 var commitErr *binarymultistmt.CommitError
+var beginErr *binarymultistmt.BeginFailedError
 switch {
 case errors.As(err, &commitErr):
     // Every statement succeeded, but COMMIT itself was rejected (e.g. a
@@ -47,6 +48,15 @@ case errors.As(err, &commitErr):
     // still healthy and there's nothing to Rollback. Decide whether to
     // retry the whole batch.
     log.Println("commit rejected, already rolled back:", commitErr)
+case errors.As(err, &beginErr):
+    // BEGIN itself was rejected (vanishingly rare) — every statement
+    // already ran under autocommit instead of inside a transaction. conn
+    // is still healthy; beginErr.Error() already renders every
+    // statement's SQL, args, and outcome for your log. Even if every
+    // statement succeeded, each ran as its own independent autocommit
+    // transaction with its own start timestamp, not one shared snapshot —
+    // decide for yourself whether that matters for this batch.
+    log.Println(beginErr)
 case err != nil:
     // connection/protocol-level failure — conn is no longer usable, Close it
     conn.Close()
@@ -109,6 +119,17 @@ If every statement succeeds but the server then rejects `COMMIT` itself
 server-side when this happens), `Execute` returns a non-nil `*CommitError`
 instead — the connection is unaffected and stays usable, and there's
 nothing to roll back.
+
+If `BEGIN` itself is rejected (vanishingly rare), `Execute` returns a
+`*BeginFailedError` instead: every statement in the batch was already
+pipelined right behind `BEGIN` and already ran under autocommit by the
+time the rejection is read. The connection stays usable, and
+`BeginFailedError.Statements` reports each statement's real outcome — but
+even an all-succeeded batch isn't automatically equivalent to
+`ExecuteAutoCommit`, since each statement got its own autocommit start
+timestamp instead of sharing one transaction's snapshot. See the
+[repository README](https://github.com/dulao5/tidb-binary-multistmt#readme)
+for the full explanation.
 
 `ExecuteAutoCommit` pipelines the same way but never sends `BEGIN`/`COMMIT`
 — each statement commits on its own. There's nothing to roll back
