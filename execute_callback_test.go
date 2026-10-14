@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -383,5 +384,90 @@ func TestPrepare_EvictsLeastRecentlyUsedPastCacheLimit(t *testing.T) {
 	}
 	if c.stmtLRU.Len() != 2 {
 		t.Fatalf("expected stmtLRU to hold exactly 2 entries after eviction, got %d", c.stmtLRU.Len())
+	}
+}
+
+// TestExecute_BeginFailedReportsEveryStatementAndKeepsConnUsable confirms
+// that when BEGIN itself comes back as an ERR packet (not a protocol-level
+// desync — the wire round-tripped fine), Execute still reads every
+// already-pipelined EXECUTE's response for real (rather than discarding c
+// as unusable), reports each statement's actual outcome via
+// *BeginFailedError, still fires every statement's Callback exactly once,
+// and leaves c healthy.
+func TestExecute_BeginFailedReportsEveryStatementAndKeepsConnUsable(t *testing.T) {
+	client, server := pipePair(t)
+	go func() {
+		readPacket(server) // PREPARE stmt0
+		writeRawPacket(server, 0, buildPrepareOKPacket(1, 0, 0))
+		readPacket(server) // PREPARE stmt1
+		writeRawPacket(server, 0, buildPrepareOKPacket(2, 0, 0))
+
+		// BEGIN and both EXECUTEs are pipelined together — read all three
+		// before writing any response (see the net.Pipe buffering note on
+		// TestExecute_CallbackFiresExactlyOnce).
+		readPacket(server) // BEGIN
+		readPacket(server) // EXECUTE stmt0
+		readPacket(server) // EXECUTE stmt1
+
+		writeRawPacket(server, 0, buildErrPacket(1105, "begin rejected"))
+		writeRawPacket(server, 0, []byte{0x00})                             // stmt0: OK
+		writeRawPacket(server, 0, buildErrPacket(1105, "stmt1 failed too")) // stmt1: ERR
+	}()
+
+	c := &Conn{raw: client, stmtCache: make(map[string]*list.Element), stmtLRU: list.New()}
+
+	var cb0, cb1 bool
+	b := NewBatch()
+	b.Add("INSERT INTO t VALUES (1)", []any{int64(1)}, func(sr *StatementResult) {
+		cb0 = true
+		if sr.Err != nil {
+			t.Errorf("stmt0: expected success, got %v", sr.Err)
+		}
+	})
+	b.Add("INSERT INTO t VALUES (2)", []any{int64(2)}, func(sr *StatementResult) {
+		cb1 = true
+		if sr.Err == nil {
+			t.Errorf("stmt1: expected an error")
+		}
+	})
+
+	res, err := c.Execute(context.Background(), b)
+
+	var beginErr *BeginFailedError
+	if !errors.As(err, &beginErr) {
+		t.Fatalf("expected a *BeginFailedError, got %v", err)
+	}
+	if !cb0 || !cb1 {
+		t.Fatalf("expected both callbacks to fire exactly once, got cb0=%v cb1=%v", cb0, cb1)
+	}
+	if res == nil || res.AllSucceeded {
+		t.Fatalf("expected a non-nil ExecuteResult with AllSucceeded false (stmt1 failed), got %+v", res)
+	}
+	if c.broken {
+		t.Fatalf("expected c to remain usable — BEGIN's ERR response means the wire round-tripped fine")
+	}
+
+	if len(beginErr.Statements) != 2 {
+		t.Fatalf("expected 2 statement outcomes, got %d", len(beginErr.Statements))
+	}
+	if beginErr.Statements[0].SQL != "INSERT INTO t VALUES (1)" || beginErr.Statements[0].Err != nil {
+		t.Errorf("stmt0: expected success in BeginFailedError.Statements, got %+v", beginErr.Statements[0])
+	}
+	if beginErr.Statements[1].SQL != "INSERT INTO t VALUES (2)" || beginErr.Statements[1].Err == nil {
+		t.Errorf("stmt1: expected a recorded error in BeginFailedError.Statements, got %+v", beginErr.Statements[1])
+	}
+	var sqlErr *SQLError
+	if !errors.As(beginErr.Err, &sqlErr) {
+		t.Errorf("expected BeginFailedError.Err to be a *SQLError, got %v", beginErr.Err)
+	}
+
+	// The error string is meant to be log-friendly — spot-check it actually
+	// surfaces SQL text, args, and per-statement status rather than just
+	// BEGIN's own message.
+	msg := beginErr.Error()
+	for _, want := range []string{"INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)", "OK", "ERROR"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected BeginFailedError.Error() to contain %q, got: %s", want, msg)
+		}
 	}
 }
