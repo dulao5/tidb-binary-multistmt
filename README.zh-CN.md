@@ -33,6 +33,16 @@ CPU profile 对比发现，真正拖累 multi-statement 模式 CPU 的是这些�
 `SET` 语句，不是文本协议还是二进制协议这个选择本身。本库换成 pipeline 方式发二进制
 `EXECUTE`，完全不需要标记。
 
+还有一种更简单的方案：干脆不用 `Prepare`，直接发普通的文本 raw query。但这样会放弃
+TiDB 的 **prepared plan cache**（`tidb_enable_prepared_plan_cache`，自 v6.1.0 起默认
+`ON`）：同一种语句形状只要规划过一次，后续执行就能复用缓存好的执行计划，不用每次重新优化
+——这正是本库瞄准的这类短小、重复、点查/范围查 SQL 最需要的收益。文本协议对应的替代品
+**non-prepared plan cache**（`tidb_enable_non_prepared_plan_cache`）默认是 `OFF`，限制也多得多：不支持三表以上
+join 或子查询、不支持 `ORDER BY`/`GROUP BY` 跟字面量、不支持 `JSON`/`ENUM`/`SET`/`BIT`
+列上的谓词、参数个数有上限，而且如果跟 prepared cache 同时开启，两者共享同一块缓存容量，
+反而可能拉低 prepared cache 的命中率。二进制 `Prepare`/`Execute` 白得这条成熟、默认开启的
+缓存路径；纯文本要么每次都得重新规划，要么只能用一个限制明显更多的缓存。
+
 ## 用法
 
 ```go

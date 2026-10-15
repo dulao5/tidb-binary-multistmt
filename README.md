@@ -42,6 +42,22 @@ comparison found those marker `SET`s — not the text-vs-binary choice itself
 — responsible for most of multi-statement mode's extra CPU. This package
 pipelines binary `EXECUTE` instead, which needs no markers at all.
 
+An even simpler alternative is to skip `Prepare` entirely and send raw,
+unprepared text queries. That gives up TiDB's **prepared plan cache**
+(`tidb_enable_prepared_plan_cache`, default `ON` since v6.1.0): once a
+statement's shape has been planned, later executions reuse the cached plan
+instead of re-optimizing from scratch — exactly the win that matters for the
+short, repeated, point/range-query SQL this package targets. The closest
+equivalent for plain text, the **non-prepared plan cache**
+(`tidb_enable_non_prepared_plan_cache`), is `OFF` by default and far more
+restricted: no 3+-table joins or subqueries, no `ORDER BY`/`GROUP BY` on
+literals, no predicates on `JSON`/`ENUM`/`SET`/`BIT` columns, a parameter-count
+cap, and — if enabled alongside the prepared cache — it shares the same cache
+budget and can lower the prepared cache's hit rate. Binary `Prepare`/`Execute`
+gets the mature, default-on caching path for free; raw text means either
+unconditional re-planning on every call or opting into a cache with
+meaningfully more gaps.
+
 ## Usage
 
 ```go
